@@ -1212,6 +1212,7 @@ class LLMManager:
         """
         try:
             import instructor
+            from instructor.core import InstructorRetryException
         except ImportError:
             raise ImportError(
                 "Run: pip install instructor>=1.2.0 "
@@ -1245,6 +1246,11 @@ class LLMManager:
                         model=self.provider.model, messages=messages,
                         response_model=response_model, temperature=temperature,
                         max_tokens=max_tokens, max_retries=1,
+                        # DeepSeek requires non-thinking mode for named tool calls.
+                        extra_body=(
+                            {"thinking": {"type": "disabled"}}
+                            if pname == "DeepSeek" else None
+                        ),
                     )
                     if isinstance(result, tuple):
                         resp, completion = result
@@ -1282,7 +1288,7 @@ class LLMManager:
 
         try:
             return self._execute_with_retry(operation, **retry_options)
-        except instructor.exceptions.InstructorRetryException as exc:
+        except InstructorRetryException as exc:
             raise RuntimeError(f"instructor structured output failed: {exc}") from exc
 
     @classmethod
