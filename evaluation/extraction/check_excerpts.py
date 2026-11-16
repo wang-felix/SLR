@@ -1,0 +1,46 @@
+"""Automatically check whether each 'source excerpt' in the extraction output really appears in the paper's PDF text.
+
+Usage:
+  python check_excerpts.py extraction_results.xlsx --pdf-dir <folder containing the PDFs, searched recursively> [--out excerpt_check.csv]
+The PDFs must be findable by the Filename in the extraction table (SLR stores uploads under those hashed names).
+Statuses: pass (all segments found), partial, fail (nothing found = suspected fabrication), language_mismatch
+(excerpt in another language than the paper: likely translated, not verbatim), no_excerpt, too_short, pdf_missing.
+"""
+import argparse
+import pandas as pd
+from extraction_utils import (read_table, pick_col, load_pdf_text, index_pdfs, norm_search, check_excerpt, wilson)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("extraction"); ap.add_argument("--pdf-dir", required=True)
+    ap.add_argument("--col-excerpt", default="source_section_table_or_text_excerpt")
+    ap.add_argument("--out", default="excerpt_check.csv")
+    a = ap.parse_args()
+    df = read_table(a.extraction)
+    fcol = pick_col(df, "filename", ["filename"], "filename")
+    ecol = pick_col(df, a.col_excerpt, ["excerpt", "source"], "source excerpt")
+    idx = index_pdfs(a.pdf_dir); cache = {}; rows = []
+    for _, r in df.iterrows():
+        name = str(r[fcol]); key = name.lower()
+        path = idx.get(key) or idx.get(key.rsplit(".", 1)[0])
+        if path is None:
+            rows.append((name, "pdf_missing", 0, 0, "")); continue
+        if path not in cache:
+            cache[path] = norm_search(load_pdf_text(path))
+        rows.append((name,) + check_excerpt(cache[path], r[ecol]))
+    out = pd.DataFrame(rows, columns=["filename", "status", "n_segments", "n_verified", "first_unverified_segment"])
+    out.to_csv(a.out, index=False, encoding="utf-8-sig")
+    vc = out.status.value_counts().to_dict()
+    checkable = out[out.status.isin(["pass", "partial", "fail"])]
+    n = len(checkable); k_fail = int((checkable.status == "fail").sum()); k_bad = int((checkable.status != "pass").sum())
+    print("status counts:", vc)
+    if n:
+        lo, hi = wilson(k_fail, n); lo2, hi2 = wilson(k_bad, n)
+        print(f"checked {n} papers with a verifiable excerpt")
+        print(f"  fabricated-looking (nothing found): {k_fail}/{n} = {k_fail/n:.1%}  (95% CI {lo:.1%} ~ {hi:.1%})")
+        print(f"  not fully verified (partial or fail): {k_bad}/{n} = {k_bad/n:.1%}  (95% CI {lo2:.1%} ~ {hi2:.1%})")
+    print("Note: 'fail' can also come from PDF-to-text differences (tables, formulas, ligatures); inspect first_unverified_segment before calling it fabrication.")
+    print(f"wrote {a.out}")
+
+if __name__ == "__main__":
+    main()

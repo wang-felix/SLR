@@ -35,3 +35,14 @@ benchmarks/results/*
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Evaluation outputs
+*.xlsx
+*sample_key*.csv
+report*.md
+flips*.csv
+disagreements.csv
+excerpt_check.csv
+*extraction_key.csv
+material_comparison.csv
+method_comparison.csv
