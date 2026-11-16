@@ -36,37 +36,106 @@ def wilson(k, n, z=1.96):
     return (max(0.0, centre - half), min(1.0, centre + half))
 
 # ---------- coating material ----------
-SYN = {"二氧化硅": "sio2", "氧化硅": "sio2", "氧化铝": "al2o3", "alumina": "al2o3", "氧化钛": "tio2", "二氧化钛": "tio2",
-       "titania": "tio2", "氧化锆": "zro2", "zirconia": "zro2", "氧化镁": "mgo", "氧化钇": "y2o3", "氧化铬": "cr2o3",
-       "氧化钙": "cao", "氮化钛": "tin", "氮化铬": "crn", "氮化钼": "mon", "氮化硅": "si3n4", "氮化铝": "aln",
-       "氮化硼": "bn", "碳化钨": "wc", "碳化铬": "cr3c2", "碳化钛": "tic", "碳化硅": "sic", "碳化硼": "b4c",
-       "石墨烯": "graphene", "金刚石类碳": "dlc", "类金刚石": "dlc"}
-STOP = {"涂层", "镀层", "基层", "层", "膜", "薄膜", "coating", "coatings", "film", "films", "layer", "composite", "复合", "基",
-        "掺杂", "掺", "添加", "doped", "doping", "with", "and", "和", "及", "为", "的", "含", "based", "base", "陶瓷",
-        "ceramic", "wt", "vol", "at", "mol", "the", "of", "on"}
+MATERIAL_ALIASES = {
+    "二氧化硅": "SiO2", "氧化硅": "SiO2", "氧化铝": "Al2O3", "alumina": "Al2O3",
+    "氧化钛": "TiO2", "二氧化钛": "TiO2", "titania": "TiO2",
+    "氧化锆": "ZrO2", "zirconia": "ZrO2", "氧化镁": "MgO", "氧化钇": "Y2O3",
+    "氧化铬": "Cr2O3", "氧化钙": "CaO", "氮化钛": "TiN", "氮化铬": "CrN",
+    "氮化钼": "MoN", "氮化硅": "Si3N4", "氮化铝": "AlN", "氮化硼": "BN",
+    "碳化钨": "WC", "碳化铬": "Cr3C2", "碳化钛": "TiC", "碳化硅": "SiC",
+    "碳化硼": "B4C", "石墨烯": "graphene", "金刚石类碳": "DLC", "类金刚石": "DLC",
+}
+_ELEMENT_SYMBOLS = set("""
+    H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn
+    Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce
+    Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At
+    Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr Rf Db Sg Bh Hs Mt Ds Rg Cn
+    Nh Fl Mc Lv Ts Og
+""".split())
+_COUNT = r"(?:\d+(?:\.\d+)?)?"
+_ATOM = rf"[A-Z][a-z]?{_COUNT}"
+_CHEMICAL_FORMULA = re.compile(rf"(?:{_ATOM}|\((?:{_ATOM})+\){_COUNT})+")
+_ELEMENT_IN_FORMULA = re.compile(r"[A-Z][a-z]?")
+_MATERIAL_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9.])[A-Za-z](?:[A-Za-z0-9]|\.(?=\d)|\([A-Za-z0-9.]+\)\d+)*"
+    r"(?![A-Za-z0-9]|\.\d)"
+)
+_MATERIAL_ALIAS_PATTERN = re.compile(
+    "|".join(
+        rf"\b{word}\b" if word.isascii() else word
+        for word in sorted(MATERIAL_ALIASES, key=len, reverse=True)
+    ),
+    re.IGNORECASE,
+)
+_KNOWN_MATERIALS = {value.casefold(): value for value in MATERIAL_ALIASES.values()}
+_ELECTROLYTE_RECIPE = re.compile(r"\([^()]*\d\s*(?:g|mg|mol|mmol)\s*/\s*L\b[^()]*\)", re.IGNORECASE)
+_MATERIAL_CLAUSE_END = (
+    r"(?=\bcoatings?\s+(?:consists?|contains?|comprises?)\b|[;；。!?\n]|\.(?=\s|$)|$)"
+)
+_SUBSTRATE = re.compile(
+    r"\b(?:(?<!based\s)on(?:to)?\s+|substrates?\s*[:=]\s*).*?"
+    r"(?=\bwith\b|[,，]|" + _MATERIAL_CLAUSE_END + r")"
+    r"|以[^,，;；。]+为(?:基材|衬底|基底)|在[^,，;；。]+(?:表面|上)(?=(?:原位)?(?:沉积|制备|形成))",
+    re.IGNORECASE,
+)
+_ELECTROLYTE = re.compile(
+    r"(?:\b(?:in|into|using)\s+(?:[^;；。()\n]*?\s)?electrolytes?\b"
+    r"|\belectrolytes?\s*(?:[:=]|contains?\b|consists?\s+of\b)).*?"
+    r"(?=\bwith\b[^;；。,]*\badditives?\b|" + _MATERIAL_CLAUSE_END + r")"
+    r"|电解液(?:组分)?\s*(?:含有?|[:：])[^;；。\n]*",
+    re.IGNORECASE,
+)
+_DOPANT_AMOUNT = re.compile(
+    r"\b(?:different|various)\s+(?P<element>[A-Z][a-z]?)\s+doping\s+contents?\b"
+    r"(?:\s*\([^()]*%[^()]*\))?"
+)
+_MEASUREMENT_UNIT = re.compile(r"(?<![A-Za-z0-9.])\d+(?:\.\d+)?\s+(?:V|kV|Pa|kPa|MPa|W|A|K|N)\b")
+_OXIDATION_STATE_LIST = re.compile(
+    r"\boxides?\s+of\s+[^();]+?\bin\s+(?:complete\s+)?oxidation\s+states?\s*\([^()]*\)",
+    re.IGNORECASE,
+)
+_ILLUSTRATIVE_MATERIAL = re.compile(r"\b(?:e\.g\.|for example\b|such as\b)|例如|诸如", re.IGNORECASE)
+_LAYER_NOTATION = re.compile(r"\b(?:multilayer|duplex)\b|多层|双层", re.IGNORECASE)
 
 def material_components(text):
-    """Turn a free-text material description into a set of normalised component tokens (formulas lower-cased)."""
+    """Extract identifiable coating components from a list or a free-text answer."""
     if is_missing(text):
         return set()
-    s = unicodedata.normalize("NFKC", str(text)).lower()
-    for zh in sorted(SYN, key=len, reverse=True):
-        s = s.replace(zh, f" {SYN[zh]} ")
-    s = re.sub(r"\d+(\.\d+)?\s*(wt|vol|at|mol)?\s*\.?\s*%", " ", s)      # drop contents such as 13wt%, 20%
-    toks = [t for t in re.split(r"[^a-z0-9\u4e00-\u9fff]+", s) if t]
-    out = set()
-    for t in toks:
-        if _CJK.search(t):                       # strip filler words glued to Chinese terms, e.g. 氧化镁基层 -> 氧化镁
-            for sw in sorted((w for w in STOP if _CJK.search(w)), key=len, reverse=True):
-                t = t.replace(sw, "")
-        if t and t not in STOP and not re.fullmatch(r"\d+(\.\d+)?", t):
-            out.add(t)
-    return out
+    s = unicodedata.normalize("NFKC", str(text))
+    s = _ELECTROLYTE_RECIPE.sub(" ", s)
+    s = _ELECTROLYTE.sub(" ", s)
+    s = _SUBSTRATE.sub(" ", s)
+    varied_dopants = {match["element"] for match in _DOPANT_AMOUNT.finditer(s)}
+    s = _DOPANT_AMOUNT.sub(" ", s)
+    s = _MEASUREMENT_UNIT.sub(" ", s)
+    s = _OXIDATION_STATE_LIST.sub(" oxides ", s)
+    s = _MATERIAL_ALIAS_PATTERN.sub(lambda m: f" {MATERIAL_ALIASES[m[0].casefold()]} ", s)
+
+    components = set()
+    for match in _MATERIAL_TOKEN.finditer(s):
+        token = match[0]
+        if _CHEMICAL_FORMULA.fullmatch(token) and all(
+            symbol in _ELEMENT_SYMBOLS for symbol in _ELEMENT_IN_FORMULA.findall(token)
+        ):
+            components.add(token)
+        elif token.casefold() in _KNOWN_MATERIALS:
+            components.add(_KNOWN_MATERIALS[token.casefold()])
+    # A doping-level annotation can repeat an element already encoded in the compound.
+    reported_elements = {
+        symbol for formula in components for symbol in _ELEMENT_IN_FORMULA.findall(formula)
+    }
+    components.update((varied_dopants & _ELEMENT_SYMBOLS) - reported_elements)
+    return components
 
 def score_material(ai, human):
     a, h = material_components(ai), material_components(human)
+    raw_answer = str(ai)
+    if (not h or (not a and not is_missing(ai))
+            or _ILLUSTRATIVE_MATERIAL.search(raw_answer)
+            or ("/" in raw_answer and _LAYER_NOTATION.search(raw_answer))):
+        return "review", None, a, h
     inter, union = a & h, a | h
-    jac = len(inter) / len(union) if union else 1.0
+    jac = len(inter) / len(union)
     if a == h:
         return "exact", jac, a, h
     return ("partial" if inter else "none"), jac, a, h

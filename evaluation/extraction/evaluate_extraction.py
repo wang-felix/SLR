@@ -1,7 +1,7 @@
 """Evaluate extraction (coating material, preparation method, source excerpt) against human answers.
 
 Usage: python evaluate_extraction.py extraction_label_sheet.xlsx extraction_key.csv [--excerpt-check excerpt_check.csv] [--out report_extraction.md]
-- coating material: both sides are reduced to a set of normalised components; exact = identical sets, partial = overlap, none = no overlap.
+- coating material: both sides are reduced to a set of normalised components; exact = identical sets, partial = overlap, none = no overlap. Ambiguous rows are reported as review.
 - preparation method: AI free text is mapped to fixed categories by keyword rules (extraction_utils.METHOD_RULES) and compared with the human's category.
 - source excerpt: summarised from the automatic check (check_excerpts.py), which needs no human labels.
 All proportions carry 95% Wilson intervals (valid even with 0 errors). Only papers the human marked 「应纳入=是」 are scored.
@@ -29,17 +29,45 @@ def main():
     # --- material ---
     mrows = []
     for _, r in elig.iterrows():
-        if pd.isna(r["人工_涂层材料"]): continue
-        sc, jac, A, H = score_material(r["ai_material"], r["人工_涂层材料"])
-        mrows.append(dict(id=r["id"], ai_raw=r["ai_material"], human_raw=r["人工_涂层材料"], ai_set=" | ".join(sorted(A)),
-                          human_set=" | ".join(sorted(H)), score=sc, jaccard=round(jac, 2), note=r["备注"]))
+        if pd.isna(r["人工_涂层材料"]):
+            continue
+        sc, jac, ai_components, reference = score_material(r["ai_material"], r["人工_涂层材料"])
+        review_reason = ""
+        if sc == "review":
+            review_reason = (
+                "参考标注缺少可核对的具体组分" if not reference
+                else "AI 答案的组分或层归属需要人工确认"
+            )
+        mrows.append({
+            "id": r["id"],
+            "ai_raw": r["ai_material"],
+            "human_raw": r["人工_涂层材料"],
+            "ai_set": " | ".join(sorted(ai_components)),
+            "human_set": " | ".join(sorted(reference)),
+            "matched": " | ".join(sorted(ai_components & reference)) if not review_reason else "",
+            "missing": " | ".join(sorted(reference - ai_components)) if not review_reason else "",
+            "extra": " | ".join(sorted(ai_components - reference)) if not review_reason else "",
+            "score": sc,
+            "jaccard": jac,
+            "review_reason": review_reason,
+            "note": r["备注"],
+        })
     m = pd.DataFrame(mrows)
     L += ["## 1. 涂层材料", ""]
-    if len(m):
-        n = len(m); ex = int((m.score == "exact").sum()); pa = int((m.score == "partial").sum())
-        L += [f"- 完全一致:{pct(ex, n)}", f"- 完全或部分一致(有重叠组分):{pct(ex + pa, n)}", f"- 平均重叠度(Jaccard):{m.jaccard.mean():.2f}",
-              "- 逐篇对照见 material_comparison.csv。归一化只处理写法差异(下标、中文名、含量),合金写法(NiCr 与 Ni-Cr)等仍可能误判,请抽看 partial/none 行,必要时修改人工答案的写法后重跑。", ""]
-        m.to_csv("material_comparison.csv", index=False, encoding="utf-8-sig")
+    if not m.empty:
+        scored = m[m.score != "review"]
+        n = len(scored)
+        L.append(f"- 有材料标注 {len(m)} 篇，自动评分 {n} 篇，待复核 {len(m) - n} 篇。")
+        if n:
+            exact = int((scored.score == "exact").sum())
+            partial = int((scored.score == "partial").sum())
+            L += [
+                f"- 完全一致：{pct(exact, n)}",
+                f"- 完全或部分一致（有重叠组分）：{pct(exact + partial, n)}",
+                f"- 平均组分重叠度（Jaccard）：{scored.jaccard.mean():.2f}",
+            ]
+        L += ["- 逐篇匹配、漏报、多报及待复核原因见 material_comparison.csv。", ""]
+        m.round({"jaccard": 2}).to_csv("material_comparison.csv", index=False, encoding="utf-8-sig")
     else:
         L += ["没有可评分的行。", ""]
 

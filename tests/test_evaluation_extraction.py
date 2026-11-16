@@ -17,10 +17,79 @@ def test_wilson_interval_has_positive_upper_bound_at_zero_errors():
 
 def test_coating_material_normalizes_formulas_synonyms_and_percentages():
     assert utils.material_components("Al₂O₃ coating with 13 wt% TiO₂") == {
-        "al2o3", "tio2"
+        "Al2O3", "TiO2"
     }
     status, overlap, _, _ = utils.score_material("氧化铝和氧化钛涂层", "Al2O3-TiO2")
     assert (status, overlap) == ("exact", 1.0)
+
+
+def test_material_scoring_ignores_substrate_and_electrolyte():
+    answer = (
+        "Al2O3-CePO4-MoS2 composite coating formed on 6061-T6 Al alloy "
+        "in an alkaline electrolyte (4 g/L NaOH)."
+    )
+
+    status, overlap, actual, expected = utils.score_material(answer, "Al2O3-CePO4-MoS2")
+
+    assert (status, overlap) == ("exact", 1.0)
+    assert actual == expected == {"Al2O3", "CePO4", "MoS2"}
+
+
+def test_coating_based_on_a_compound_is_not_substrate_context():
+    answer = "Ceramic coating based on MgO and MgF2 deposited on AZ31 Mg alloy."
+
+    assert utils.material_components(answer) == {"MgO", "MgF2"}
+
+
+def test_material_scoring_drops_electrolyte_recipe_and_voltage_units():
+    answer = (
+        "Coating formed on Mg alloy in alkaline electrolyte (NaOH, KF) "
+        "with graphene additive; coatings consist of MgO only at 200 V."
+    )
+
+    assert utils.material_components(answer) == {"MgO", "graphene"}
+
+
+def test_dopant_amount_does_not_double_count_an_element_in_the_formula():
+    text = "AlSiN coating with different Si doping contents (1 wt.% and 2 wt.% Si)"
+
+    assert utils.material_components(text) == {"AlSiN"}
+    assert utils.material_components(text.replace("AlSiN", "AlN")) == {"AlN", "Si"}
+
+
+def test_material_scoring_keeps_formula_groups_and_decimals():
+    status, overlap, actual, expected = utils.score_material(
+        "Hf₀.₅Zr₀.₅O₂ and Ca(OH)2", "Hf0.5Zr0.5O2/Ca(OH)2"
+    )
+
+    assert (status, overlap) == ("exact", 1.0)
+    assert actual == expected == {"Hf0.5Zr0.5O2", "Ca(OH)2"}
+
+
+def test_material_scoring_detects_real_omissions():
+    answer = (
+        "SiC particles reinforced a coating on AZ31 Mg alloy; "
+        "fabricated in a phosphate electrolyte (4 g/L Na3PO4)."
+    )
+
+    status, overlap, actual, expected = utils.score_material(answer, "MgO-Mg3(PO4)2-SiC")
+
+    assert status == "partial"
+    assert overlap == pytest.approx(1 / 3)
+    assert expected - actual == {"MgO", "Mg3(PO4)2"}
+    assert not actual - expected
+
+
+@pytest.mark.parametrize(
+    ("answer", "reference"),
+    [
+        ("MgO-MgAl2O4", "氧化物陶瓷"),
+        ("Oxide coatings, e.g. MgO", "MgO"),
+        ("Ti/TiO2 duplex coating", "TiO2"),
+    ],
+)
+def test_material_scoring_defers_ambiguous_results(answer, reference):
+    assert utils.score_material(answer, reference)[:2] == ("review", None)
 
 
 @pytest.mark.parametrize(
@@ -54,7 +123,11 @@ def test_excerpt_status(excerpt, status, verified):
     assert bool(result[3]) == (status != "pass")
 
 
-def test_extraction_sample_and_evaluation_use_human_answers(tmp_path):
+@pytest.mark.parametrize(
+    ("reference", "expected_score"),
+    [("氧化铝", "exact"), ("氧化物陶瓷", "review")],
+)
+def test_extraction_sample_and_evaluation_use_human_answers(tmp_path, reference, expected_score):
     scripts = Path(__file__).resolve().parents[1] / "evaluation" / "extraction"
     results = tmp_path / "extraction.csv"
     pd.DataFrame(
@@ -79,7 +152,7 @@ def test_extraction_sample_and_evaluation_use_human_answers(tmp_path):
     assert labels["人工_涂层材料"].isna().all()
     assert labels["人工_制备方法类别"].isna().all()
     labels.loc[0, ["该论文应纳入吗", "人工_涂层材料", "人工_制备方法类别"]] = [
-        "是", "氧化铝", "超音速火焰喷涂(HVOF/HVAF)"
+        "是", reference, "超音速火焰喷涂(HVOF/HVAF)"
     ]
     labels.to_excel(labels_path, sheet_name="标注表", index=False)
 
@@ -89,5 +162,13 @@ def test_extraction_sample_and_evaluation_use_human_answers(tmp_path):
         cwd=tmp_path, check=True, capture_output=True, text=True,
     )
 
-    assert pd.read_csv(tmp_path / "material_comparison.csv").loc[0, "score"] == "exact"
+    material = pd.read_csv(tmp_path / "material_comparison.csv", keep_default_na=False).iloc[0]
+    assert material["score"] == expected_score
+    report = (tmp_path / "report_extraction.md").read_text(encoding="utf-8")
+    if expected_score == "review":
+        assert "自动评分 0 篇，待复核 1 篇" in report
+        assert material["review_reason"] and not material["extra"]
+    else:
+        assert material["matched"] == "Al2O3"
+        assert not material["missing"] and not material["extra"]
     assert pd.read_csv(tmp_path / "method_comparison.csv").loc[0, "correct"] == 1
