@@ -205,30 +205,37 @@ def _parse_json_response(raw: str) -> Dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _structured_error_response(error: Exception) -> Optional[str]:
-    while error is not None:
-        completion = getattr(error, 'last_completion', None)
-        if completion is not None:
-            choices = getattr(completion, 'choices', None)
-            if choices:
-                message = getattr(choices[0], 'message', None)
-                arguments = [
-                    call.function.arguments for call in (getattr(message, 'tool_calls', None) or [])
-                    if isinstance(getattr(getattr(call, 'function', None), 'arguments', None), str)
-                ]
-                if arguments:
-                    return '\n'.join(arguments)
-                content = getattr(message, 'content', None)
-                return content if isinstance(content, str) else None
+    try:
+        for _ in range(10):
+            if error is None:
+                break
+            completion = getattr(error, 'last_completion', None)
+            if completion is not None:
+                choices = getattr(completion, 'choices', None)
+                if choices is not None:
+                    if not choices:
+                        return None
+                    message = getattr(choices[0], 'message', None)
+                    arguments = [
+                        call.function.arguments for call in (getattr(message, 'tool_calls', None) or [])
+                        if isinstance(getattr(getattr(call, 'function', None), 'arguments', None), str)
+                    ]
+                    if arguments:
+                        return '\n'.join(arguments)
+                    content = getattr(message, 'content', None)
+                    return content if isinstance(content, str) else None
 
-            content = getattr(completion, 'content', None)
-            if isinstance(content, str):
-                return content
-            text_parts = [
-                block.text for block in (content or [])
-                if isinstance(getattr(block, 'text', None), str)
-            ]
-            return ''.join(text_parts) if text_parts else None
-        error = getattr(error, 'original_error', None) or error.__cause__
+                content = getattr(completion, 'content', None)
+                if isinstance(content, str):
+                    return content
+                text_parts = [
+                    block.text for block in (content or [])
+                    if isinstance(getattr(block, 'text', None), str)
+                ]
+                return ''.join(text_parts) if text_parts else None
+            error = getattr(error, 'original_error', None) or getattr(error, '__cause__', None)
+    except Exception:
+        return None
     return None
 
 
@@ -539,6 +546,8 @@ class SystematicReviewAutomation:
         failure_stage: str = None,
         raw_response: Optional[str] = None,
         parse_retry_count: int = 0,
+        retry_first_raw_response: Optional[str] = None,
+        exception_type: Optional[str] = None,
     ):
         provider_profile = cache_context.get('provider_profile') or {}
         text_cache_metadata = self.get_paper_text_metadata(filename)
@@ -577,41 +586,51 @@ class SystematicReviewAutomation:
             event['error'] = error
         if failure_stage:
             event['failure_stage'] = failure_stage
-        if failure_stage or parse_retry_count:
+        if status == 'error':
             event['raw_response'] = raw_response[:4000] if isinstance(raw_response, str) else None
-        self._append_audit_event(event)
-
-    def _write_run_config(self):
-        provider_profile = self._provider_cache_metadata()
-        extraction = {'plain_json': {'temperature': self.temperature, 'max_tokens': self.max_output_tokens}}
-        adapter = getattr(self.llm_manager, 'profile', {}).get('adapter')
-        if adapter in ('native_openai', 'openai_compatible', 'native_ollama', 'native_anthropic'):
-            extraction['structured'] = {
-                'temperature': '未传' if adapter == 'native_anthropic' else self.temperature,
-                'max_tokens': self.max_output_tokens,
-            }
-        self._append_audit_event({
-            'kind': 'run_config',
-            'timestamp': datetime.now().isoformat(timespec='seconds'),
-            'app_version': __version__,
-            'pipeline_version': __version__,
-            'provider': provider_profile['provider'],
-            'model': provider_profile['model'],
-            'base_url': provider_profile['base_url'],
-            'screening_prompt': self.screening_prompt,
-            'extraction_prompt': self.extraction_prompt,
-            'extraction_fields': self.extraction_fields,
-            'screening': {'temperature': self.temperature, 'max_tokens': min(1500, self.max_output_tokens)},
-            'extraction': extraction,
-        })
-
-    def _append_audit_event(self, event: Dict[str, Any]):
+            if exception_type is not None:
+                event['exception_type'] = exception_type
+        if parse_retry_count > 0:
+            event['retry_first_raw_response'] = (
+                retry_first_raw_response[:4000] if isinstance(retry_first_raw_response, str) else None
+            )
         try:
-            with self._audit_lock:
-                with open(self.audit_ledger, 'a', encoding='utf-8') as f:
-                    f.write(_canonical_json(event) + '\n')
+            self._append_audit_event(event)
         except Exception as e:
             self.logger.warning(f"Audit ledger write: {e}")
+
+    def _write_run_config(self):
+        try:
+            provider_profile = self._provider_cache_metadata()
+            extraction = {'plain_json': {'temperature': self.temperature, 'max_tokens': self.max_output_tokens}}
+            profile = getattr(self.llm_manager, 'profile', None) or {}
+            adapter = profile.get('adapter')
+            if adapter in ('native_openai', 'openai_compatible', 'native_ollama', 'native_anthropic'):
+                extraction['structured'] = {
+                    'temperature': 'not_sent' if adapter == 'native_anthropic' else self.temperature,
+                    'max_tokens': self.max_output_tokens,
+                }
+            self._append_audit_event({
+                'kind': 'run_config',
+                'timestamp': datetime.now().isoformat(timespec='seconds'),
+                'app_version': __version__,
+                'pipeline_version': __version__,
+                'provider': provider_profile['provider'],
+                'model': provider_profile['model'],
+                'base_url': provider_profile['base_url'],
+                'screening_prompt': self.screening_prompt,
+                'extraction_prompt': self.extraction_prompt,
+                'extraction_fields': self.extraction_fields,
+                'screening': {'temperature': self.temperature, 'max_tokens': min(1500, self.max_output_tokens)},
+                'extraction': extraction,
+            })
+        except Exception:
+            self.logger.warning("Run configuration audit write failed")
+
+    def _append_audit_event(self, event: Dict[str, Any]):
+        with self._audit_lock:
+            with open(self.audit_ledger, 'a', encoding='utf-8') as f:
+                f.write(_canonical_json(event) + '\n')
 
     def _cache_metadata_matches(
         self,
@@ -812,12 +831,12 @@ class SystematicReviewAutomation:
             self._llm_thread_local.metadata = getter()
         return dict(getattr(self._llm_thread_local, 'metadata', {}))
 
-    def _audit_llm_metadata(self, default_error_category: str = None) -> Dict[str, Any]:
+    def _audit_llm_metadata(self) -> Dict[str, Any]:
         metadata = dict(getattr(self._llm_thread_local, 'metadata', {}))
         return {
             'retry_count': int(metadata.get('retry_count', 0) or 0),
             'final_status': metadata.get('final_status'),
-            'error_category': metadata.get('error_category') or default_error_category,
+            'error_category': metadata.get('error_category'),
             'rate_limit_wait_seconds': float(metadata.get('rate_limit_wait_seconds', 0.0) or 0.0),
             'backoff_wait_seconds': float(metadata.get('backoff_wait_seconds', 0.0) or 0.0),
         }
@@ -1070,6 +1089,7 @@ class SystematicReviewAutomation:
             ]
             for attempt in range(PARSE_RETRY_LIMIT + 1):
                 failure_stage = 'request'
+                raw = None
                 raw, attempt_tokens = self._llm_call(
                     messages, temperature=self.temperature, max_tokens=min(1500, self.max_output_tokens),
                 )
@@ -1127,7 +1147,7 @@ class SystematicReviewAutomation:
                 tokens=tokens,
                 decision=result.decision,
                 parse_retry_count=parse_retry_count,
-                raw_response=first_failed_raw,
+                retry_first_raw_response=first_failed_raw,
                 **llm_metadata,
             )
             return result
@@ -1145,12 +1165,14 @@ class SystematicReviewAutomation:
                 cache_hit=False,
                 status='error',
                 parse_status='error',
-                **self._audit_llm_metadata(type(e).__name__),
+                **self._audit_llm_metadata(),
                 error=safe_error,
                 tokens=tokens,
                 failure_stage=failure_stage,
                 parse_retry_count=parse_retry_count,
-                raw_response=first_failed_raw if parse_retry_count else raw,
+                raw_response=raw,
+                retry_first_raw_response=first_failed_raw,
+                exception_type=type(e).__name__,
             )
             return ScreeningResult(
                 filename=filename,
@@ -1243,6 +1265,7 @@ class SystematicReviewAutomation:
             if data is None:
                 for attempt in range(PARSE_RETRY_LIMIT + 1):
                     failure_stage = 'request'
+                    raw = None
                     raw, attempt_tokens = self._llm_call(
                         messages, temperature=self.temperature, max_tokens=self.max_output_tokens,
                     )
@@ -1300,7 +1323,7 @@ class SystematicReviewAutomation:
                 cache_hit=False,
                 tokens=tokens,
                 parse_retry_count=parse_retry_count,
-                raw_response=first_failed_raw,
+                retry_first_raw_response=first_failed_raw,
                 **llm_metadata,
             )
             return result
@@ -1319,12 +1342,14 @@ class SystematicReviewAutomation:
                 cache_hit=False,
                 status='error',
                 parse_status='error',
-                **self._audit_llm_metadata(type(e).__name__),
+                **self._audit_llm_metadata(),
                 error=safe_error,
                 tokens=tokens,
                 failure_stage=failure_stage,
                 parse_retry_count=parse_retry_count,
-                raw_response=first_failed_raw if parse_retry_count else raw,
+                raw_response=raw,
+                retry_first_raw_response=first_failed_raw,
+                exception_type=type(e).__name__,
             )
             return ExtractionResult(
                 filename=filename,

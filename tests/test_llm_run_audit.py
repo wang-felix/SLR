@@ -1,9 +1,11 @@
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
-from housing_enhanced import SystematicReviewAutomation, __version__
+import housing_enhanced
+from housing_enhanced import SystematicReviewAutomation, __version__, _structured_error_response
 from llm_interface import LLMCallError
 
 
@@ -36,7 +38,7 @@ def audit_rows(auto):
     "provider, adapter, limit, screening_limit, structured_temperature",
     [
         ("DeepSeek", "openai_compatible", 4200, 1500, 0.31),
-        ("Anthropic", "native_anthropic", 700, 700, "未传"),
+        ("Anthropic", "native_anthropic", 700, 700, "not_sent"),
     ],
 )
 def test_run_config_is_written_once_before_each_batch(
@@ -80,6 +82,52 @@ def test_run_config_is_written_once_before_each_batch(
     assert all(secret not in ledger for secret in ("fixture-api-key", "fixture-password", "fixture-url-key"))
 
 
+def test_run_config_audit_failure_does_not_stop_processing(make_automation, monkeypatch):
+    auto = make_automation(screening_prompt="private template {text}", parallel_processing=False)
+    auto.pdf_folder.mkdir()
+    (auto.pdf_folder / "paper.pdf").touch()
+    monkeypatch.setattr(auto, "extract_text_from_pdf", lambda path: ("paper text", True))
+    monkeypatch.setattr(auto, "_llm_call", lambda *args, **kwargs: ('{"decision":"Likely Exclude"}', 3))
+    warning = Mock()
+    monkeypatch.setattr(auto.logger, "warning", warning)
+    canonical_json = housing_enhanced._canonical_json
+
+    def fail_run_config(event):
+        if isinstance(event, dict) and event.get("kind") == "run_config":
+            raise ValueError("fixture-api-key private template")
+        return canonical_json(event)
+
+    monkeypatch.setattr(housing_enhanced, "_canonical_json", fail_run_config)
+    assert auto.process_pdfs()["screened_count"] == 1
+    event, = audit_rows(auto)
+    assert event["decision"] == "Likely Exclude"
+    warning.assert_called_once_with("Run configuration audit write failed")
+
+
+def test_run_config_accepts_none_profile(make_automation):
+    auto = make_automation()
+    auto.llm_manager.profile = None
+    auto.process_pdfs()
+    row, = audit_rows(auto)
+    assert row["kind"] == "run_config"
+    assert row["extraction"] == {"plain_json": {"temperature": 0.05, "max_tokens": 4000}}
+
+
+def test_structured_error_response_handles_bad_chains_and_completions():
+    cycle = SimpleNamespace()
+    cycle.original_error = cycle
+    assert _structured_error_response(cycle) is None
+    assert _structured_error_response(SimpleNamespace()) is None
+    assert _structured_error_response(SimpleNamespace(last_completion=SimpleNamespace(choices=[]))) is None
+    assert _structured_error_response(SimpleNamespace(last_completion=SimpleNamespace(choices=True))) is None
+
+    error = SimpleNamespace(last_completion=SimpleNamespace(content="reply"))
+    for _ in range(9):
+        error = SimpleNamespace(original_error=error)
+    assert _structured_error_response(error) == "reply"
+    assert _structured_error_response(SimpleNamespace(original_error=error)) is None
+
+
 @pytest.mark.parametrize("path", ["screen_article", "extract_data"])
 @pytest.mark.parametrize(
     "raw, expected, stage",
@@ -94,7 +142,8 @@ def test_failed_plain_response_audit(make_automation, monkeypatch, path, raw, ex
     assert event["status"] == "error"
     assert event["raw_response"] == expected
     assert event["failure_stage"] == stage
-    assert event["error_category"] == "ValueError"
+    assert "error_category" not in event
+    assert event["exception_type"] == "ValueError"
 
 
 @pytest.mark.parametrize("representation", ["text", "tool_arguments", "unavailable"])
@@ -127,6 +176,7 @@ def test_final_structured_failure_extracts_original_reply(make_automation, monke
     assert event["status"] == "error"
     assert event["failure_stage"] == "structured"
     assert event["raw_response"] == expected
+    assert event["exception_type"] == "LLMCallError"
     assert event["parse_retry_count"] == 0
     assert len(calls) == 1
 
@@ -139,6 +189,7 @@ def test_success_event_has_no_raw_reply(make_automation, monkeypatch):
     assert event["status"] == "ok"
     assert "raw_response" not in event
     assert "failure_stage" not in event
+    assert "exception_type" not in event
 
 
 def test_fixed_cache_keys(make_automation):
@@ -185,7 +236,7 @@ def test_plain_parse_retry_uses_identical_request_and_keeps_first_reply(
     auto = make_automation()
     monkeypatch.setattr(auto, "_generate_dynamic_schema", lambda: None)
     valid = '{"decision":"Likely Include"}' if path == "screen_article" else '{"coating_material":"TiN"}'
-    second = valid if recovers else "still not JSON"
+    second = valid if recovers else "still not JSON " * 300
     replies = iter([(bad_response, 8), (second, 13)])
     requests = []
 
@@ -200,7 +251,13 @@ def test_plain_parse_retry_uses_identical_request_and_keeps_first_reply(
     assert requests[0] == requests[1]
     assert event["parse_retry_count"] == 1
     assert event["retry_count"] == 0
-    assert event["raw_response"] == bad_response[:4000]
+    assert event["retry_first_raw_response"] == bad_response[:4000]
+    if recovers:
+        assert "raw_response" not in event
+        assert "exception_type" not in event
+    else:
+        assert event["raw_response"] == second[:4000]
+        assert event["exception_type"] == "ValueError"
     assert event["api_tokens_used"] == result.api_tokens_used == auto.stats["total_api_tokens"] == 21
     assert event["status"] == ("ok" if recovers else "error")
     if path == "screen_article":
@@ -212,13 +269,19 @@ def test_plain_parse_retry_uses_identical_request_and_keeps_first_reply(
 
 @pytest.mark.parametrize("path", ["screen_article", "extract_data"])
 @pytest.mark.parametrize("category", ["timeout", "auth_error"])
-def test_provider_failure_does_not_trigger_parse_retry(make_automation, monkeypatch, path, category):
+@pytest.mark.parametrize("after_parse_failure", [False, True])
+def test_provider_failure_does_not_trigger_parse_retry(
+    make_automation, monkeypatch, path, category, after_parse_failure
+):
     auto = make_automation()
     monkeypatch.setattr(auto, "_generate_dynamic_schema", lambda: None)
     calls = []
 
     def fail_request(messages, **kwargs):
         calls.append(messages)
+        if after_parse_failure and len(calls) == 1:
+            return "first reply is not JSON", 2
+        auto._llm_thread_local.metadata = {"error_category": category}
         raise LLMCallError(
             "fake provider failure", category=category, retry_count=0, original_error=RuntimeError(),
         )
@@ -226,10 +289,16 @@ def test_provider_failure_does_not_trigger_parse_retry(make_automation, monkeypa
     monkeypatch.setattr(auto, "_llm_call", fail_request)
     getattr(auto, path)("paper", "paper.pdf")
     event, = audit_rows(auto)
-    assert len(calls) == 1
+    assert len(calls) == 1 + int(after_parse_failure)
     assert event["status"] == "error"
-    assert event["parse_retry_count"] == 0
+    assert event["parse_retry_count"] == int(after_parse_failure)
     assert event["raw_response"] is None
+    if after_parse_failure:
+        assert event["retry_first_raw_response"] == "first reply is not JSON"
+    else:
+        assert "retry_first_raw_response" not in event
+    assert event["error_category"] == category
+    assert event["exception_type"] == "LLMCallError"
     assert event["failure_stage"] == "request"
     assert not list(auto.cache_folder.glob("*.json"))
 
