@@ -153,7 +153,7 @@ def _install_fake_google_genai(monkeypatch, response):
     class FakeClient:
         last = None
 
-        def __init__(self, api_key=None):
+        def __init__(self, api_key=None, http_options=None):
             self.api_key = api_key
             self.models = FakeModels()
             FakeClient.last = self
