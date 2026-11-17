@@ -1,5 +1,7 @@
 """Shared helpers for evaluating SLR Assistant *extraction* output (coating material, preparation method, source excerpt)."""
 import math, re, unicodedata, difflib
+from bisect import bisect_left
+from functools import cache
 from pathlib import Path
 import pandas as pd
 
@@ -173,6 +175,19 @@ def classify_method(text):
 # ---------- source excerpt check ----------
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _LOCATION_PREFIX = re.compile(r"^(?:(?:section|table|fig(?:ure)?)\b|sec\.|§)", re.IGNORECASE)
+_INLINE_TAG = re.compile(r"</?(?:sup|sub|b|i|em|strong|span)[ \t]*>", re.IGNORECASE)
+_PAGE_NUMBER = r"[ \t]*(?:page[ \t]+)?\d{1,4}[ \t]+of[ \t]+\d{1,4}[ \t]*"
+_PAGE_NUMBER_LINE = re.compile(rf"^{_PAGE_NUMBER}(?:\n|$)", re.IGNORECASE | re.MULTILINE)
+_JOURNAL_HEADER = r"[ \t]*_[^_\n]+_[ \t]+\*\*\d{4}\*\*[ \t]*,[ \t]*_\d+_[ \t]*,[ \t]*\d+[ \t]*"
+_BLANK_LINES = r"(?:[ \t]*\n)*"
+_HYPHENATED_BREAK = re.compile(
+    rf"(?<=[^\W\d_])-[ \t]*\n{_BLANK_LINES}"
+    rf"(?:(?i:{_PAGE_NUMBER})\n{_BLANK_LINES}(?:{_JOURNAL_HEADER}\n{_BLANK_LINES})?)?"
+    r"[ \t]*(?=[a-z])"
+)
+_CAPTION = re.compile(r"^[ \t]*(?:fig(?:ure)?\.?|table)[ \t]+\d+[a-z]?\b", re.IGNORECASE | re.MULTILINE)
+_FRAGMENT_WORD_COUNTS = (10, 9, 8)
+_FRAGMENT_SPAN_LIMIT = 800
 
 
 def parse_excerpt_field(value):
@@ -188,31 +203,96 @@ def parse_excerpt_field(value):
         return "", text, "location_only"
     return text, "", None
 
-def norm_search(s):
-    s = unicodedata.normalize("NFKC", str(s)).lower()
+def _prepare_search_text(s):
+    s = unicodedata.normalize("NFKC", str(s)).replace("\r\n", "\n").replace("\r", "\n")
+    s = _INLINE_TAG.sub("", s)
     s = re.sub(r"[\u2010-\u2015\u2212]", "-", s)
-    s = re.sub(r"-\s*\n\s*", "", s)               # hyphenation at line breaks
-    s = re.sub(r"[*_`#>|\\\[\]]", " ", s)         # markdown produced by the PDF-to-text step
-    return re.sub(r"\s+", "", s)
+    s = _HYPHENATED_BREAK.sub("", s)
+    s = _PAGE_NUMBER_LINE.sub("", s)
+    return re.sub(r"[*_`#>|\\\[\]]", " ", s.lower())  # Markdown from the PDF converter
+
+
+def norm_search(s):
+    return re.sub(r"\s+", "", _prepare_search_text(s))
 
 def split_excerpt(excerpt, min_len=12):
     parts = re.split(r"[\n;；。]|\.\.\.|…|\u2026", str(excerpt))
     segs = [norm_search(p) for p in parts]
     return [p for p in segs if len(p) >= min_len]
 
-def check_excerpt(text_norm, excerpt, near=0.8):
+def _matches_fragmented(text, text_norm, excerpt):
+    words = _prepare_search_text(excerpt).split()
+    min_words = min(_FRAGMENT_WORD_COUNTS)
+    if len(words) < 2 * min_words or sum(map(len, words)) > _FRAGMENT_SPAN_LIMIT:
+        return False
+
+    # Map whitespace-insensitive search hits back to character positions with whitespace.
+    positions = [i for i, char in enumerate(text) if not char.isspace()]
+
+    def occurrences(fragment, start, stop):
+        while (hit := text_norm.find(fragment, start, stop)) != -1:
+            end = hit + len(fragment)
+            left, right = positions[hit], positions[end - 1] + 1
+            inside_left = left > 0 and fragment[0].isalnum() and text[left - 1].isalnum()
+            inside_right = right < len(text) and fragment[-1].isalnum() and text[right].isalnum()
+            if not (inside_left or inside_right):
+                yield hit, end
+            start = hit + 1
+
+    @cache
+    def chunks(offset):
+        remaining = len(words) - offset
+        sizes = (remaining,) if remaining < min_words else _FRAGMENT_WORD_COUNTS
+        return [(offset + size, "".join(words[offset:offset + size])) for size in sizes if size <= remaining]
+
+    starts = chunks(0)
+    if _CAPTION.search(text):
+        # A caption can interrupt a sentence after only its first few words.
+        starts = starts + [(size, "".join(words[:size])) for size in range(1, min_words)]
+    for offset, first in starts:
+        for begin, end in occurrences(first, 0, len(text_norm)):
+            stop = bisect_left(positions, positions[begin] + _FRAGMENT_SPAN_LIMIT)
+
+            @cache
+            def follows(word_offset, previous_end):
+                if word_offset == len(words):
+                    return True
+                for next_offset, fragment in chunks(word_offset):
+                    short_edge = word_offset < min_words or next_offset - word_offset < min_words
+                    for start, finish in occurrences(fragment, previous_end, stop):
+                        if short_edge and start != previous_end:
+                            gap = text[positions[previous_end - 1] + 1:positions[start]]
+                            if not _CAPTION.search(gap):
+                                continue
+                        if follows(next_offset, finish):
+                            return True
+                return False
+
+            if follows(offset, end):
+                return True
+    return False
+
+
+def check_excerpt(pdf_text, excerpt, near=0.8):
     """Return (status, n_segments, n_verified, first_unverified_segment).
-    status: pass | partial | fail | language_mismatch | no_excerpt | too_short"""
+    status: pass | pass_fragmented | partial | fail | language_mismatch | no_excerpt | too_short"""
     if is_missing(excerpt):
         return "no_excerpt", 0, 0, ""
     segs = split_excerpt(excerpt)
     if not segs:
         return "too_short", 0, 0, ""
+    text = _prepare_search_text(pdf_text)
+    text_norm = re.sub(r"\s+", "", text)
+    exact = [seg in text_norm for seg in segs]
+    if all(exact):
+        return "pass", len(segs), len(segs), ""
+    if _matches_fragmented(text, text_norm, excerpt):
+        return "pass_fragmented", len(segs), len(segs), ""
     ex_cjk = len(_CJK.findall(str(excerpt))) / max(len(str(excerpt)), 1)
     tx_cjk = len(_CJK.findall(text_norm)) / max(len(text_norm), 1)
     ok, first_bad = 0, ""
-    for seg in segs:
-        if seg in text_norm:
+    for seg, matched in zip(segs, exact):
+        if matched:
             ok += 1; continue
         sm = difflib.SequenceMatcher(None, text_norm, seg, autojunk=False)
         m = sm.find_longest_match(0, len(text_norm), 0, len(seg))

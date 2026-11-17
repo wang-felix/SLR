@@ -27,9 +27,14 @@ python check_excerpts.py extraction_results.xlsx --pdf-dir pdfs --excerpt-column
 
 旧字段支持 `原文引句 || 章节位置`，分隔符两侧各有一个空格。脚本只匹配 `||` 前的引句，并把分隔符后的说明保存到 `excerpt_check.csv` 的 `location` 列。旧结果没有分隔符时，以 `Section`、`Sec.`、`Table`、`Fig`（含 `Figure`）或 `§` 开头的字段按位置说明处理，忽略大小写。其他旧字段仍按原规则匹配。
 
+匹配前移除 `<sup>`、`<sub>` 等简单行内格式标签，保留标签内的内容。去掉 `3 of 18` 这类独立页码行，接回行末连字符断开的单词。跨页接词时，只略过可识别的页码和紧邻页码的固定格式刊名行。普通数字行及其他正文保留。
+
+连续匹配失败时，引句可按约 8–10 个词分段。要求所有词都被覆盖，各段在 PDF 转出的文字中按序逐字匹配，且首段开头到末段结尾最多跨 800 个字符（以保留空白的归一化文本计）。末段可有较短的余词。可识别的 `Fig.`、`Figure` 或 `Table` 图表标题可以隔开较短的边缘片段。校验器不会全局删除图注。
+
 | 状态 | 含义 |
 | --- | --- |
 | `pass` | 所有引句片段匹配。 |
+| `pass_fragmented` | 连续匹配未通过，所有分段在限定距离内按原顺序匹配。 |
 | `partial` | 部分引句片段匹配。 |
 | `fail` | 所有引句片段均未在 PDF 转出的文字中匹配。 |
 | `language_mismatch` | 脚本检测到引句与 PDF 文字语言不一致。 |
@@ -38,7 +43,7 @@ python check_excerpts.py extraction_results.xlsx --pdf-dir pdfs --excerpt-column
 | `location_only` | 旧字段只给了位置说明，该说明保存在 `location` 列。 |
 | `no_excerpt` / `too_short` | 引句为空，或切分后没有足够长的片段。 |
 
-匹配比例仅统计 `pass`、`partial`、`fail`。`not_found` 和 `location_only` 单独计数。复核未匹配的结果时，可用 `first_unverified_segment` 回查 PDF 原文。
+原有匹配比例仅统计 `pass`、`partial`、`fail`。`pass_fragmented`、`not_found` 和 `location_only` 单独计数。复核未匹配的结果时，可用 `first_unverified_segment` 回查 PDF 原文。
 
 ### 涂层材料评分
 

@@ -107,7 +107,8 @@ def main():
                   f"- 未完全核实(部分或找不到):{pct(int((chk.status != 'pass').sum()), n)}"]
         else:
             L += ["- 本次没有可计分的引句，匹配比例不适用。"]
-        L += ["- 匹配比例仅统计 pass、partial、fail。not_found 表示字段声明找不到可引用句子，location_only 表示字段只有位置说明，两者单独计数。",
+        L += ["- 匹配比例仅统计 pass、partial、fail。pass_fragmented 表示引句分段按序匹配，单独计数。",
+              "- not_found 表示字段声明找不到可引用句子，location_only 表示字段只有位置说明，两者单独计数。",
               "- language_mismatch 表示引句语言与论文不同，pdf_missing 表示没找到对应 PDF。",
               "- 未匹配可能来自 PDF 转文字的差异（表格、公式、连字符），也可能是字段内容并非引句。请结合 excerpt_check.csv 的 first_unverified_segment 与 PDF 原文复核。", ""]
     else:

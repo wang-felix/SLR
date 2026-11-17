@@ -4,12 +4,13 @@ Usage:
   python check_excerpts.py extraction_results.xlsx --pdf-dir <folder containing the PDFs, searched recursively> [--excerpt-column COLUMN] [--out excerpt_check.csv]
 The PDFs must be findable by the Filename in the extraction table (SLR stores uploads under those hashed names).
 The source field accepts "verbatim quote || location" or "NOT_FOUND".
-Statuses: pass (all segments found), partial, fail (no segment matched), language_mismatch,
+Statuses: pass (all segments found), pass_fragmented (all fragments found in order nearby),
+partial, fail (no segment matched), language_mismatch,
 no_excerpt, too_short, pdf_missing, not_found, location_only.
 """
 import argparse
 import pandas as pd
-from extraction_utils import (read_table, pick_col, norm_col, load_pdf_text, index_pdfs, norm_search,
+from extraction_utils import (read_table, pick_col, norm_col, load_pdf_text, index_pdfs,
                               parse_excerpt_field, check_excerpt, wilson)
 
 def main():
@@ -40,7 +41,7 @@ def main():
             rows.append((name, "pdf_missing", 0, 0, "", location))
             continue
         if path not in cache:
-            cache[path] = norm_search(load_pdf_text(path))
+            cache[path] = load_pdf_text(path)
         rows.append((name,) + check_excerpt(cache[path], quote) + (location,))
     out = pd.DataFrame(rows, columns=["filename", "status", "n_segments", "n_verified",
                                       "first_unverified_segment", "location"])
@@ -49,6 +50,8 @@ def main():
     checkable = out[out.status.isin(["pass", "partial", "fail"])]
     n = len(checkable); k_fail = int((checkable.status == "fail").sum()); k_bad = int((checkable.status != "pass").sum())
     print("status counts:", vc)
+    if vc.get("pass_fragmented"):
+        print(f"fragmented matches (reported separately): {vc['pass_fragmented']}")
     if n:
         lo, hi = wilson(k_fail, n); lo2, hi2 = wilson(k_bad, n)
         print(f"checked {n} papers with a verifiable excerpt")

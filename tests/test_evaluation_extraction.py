@@ -123,6 +123,52 @@ def test_excerpt_status(excerpt, status, verified):
     assert bool(result[3]) == (status != "pass")
 
 
+def test_excerpt_ignores_super_and_subscript_tags():
+    text = "The H<sub>2</sub>O sample was tested at 4 mA/cm<SUP>2</SUP>."
+    quote = "The H2O sample was tested at 4 mA/cm2."
+
+    assert utils.check_excerpt(text, quote) == ("pass", 1, 1, "")
+
+
+def test_excerpt_rejoins_a_word_split_across_a_page_header():
+    text = (
+        "The probe acted as an an-\r\n\r\n3 of 18\r\n\r\n"
+        "_Sample Journal_ **2026**, _10_, 200\r\n\r\n"
+        "ode during the test."
+    )
+    quote = "The probe acted as an anode during the test."
+
+    assert utils.check_excerpt(text, quote) == ("pass", 1, 1, "")
+    assert utils.norm_search("sample\n3 of 18\n42\nvalue") == "sample42value"
+
+
+def test_excerpt_matches_fragments_with_a_caption_after_the_first_word():
+    tail = (
+        "the chosen conditions the cooled specimen was weighed before and after cleaning "
+        "to measure the amount of loose residue remaining on its surface."
+    )
+    text = "Under\n\n**Fig. 2.** Overview of the test fixture.\n\n" + tail
+
+    assert utils.check_excerpt(text, "Under " + tail) == ("pass_fragmented", 1, 1, "")
+
+
+@pytest.mark.parametrize("case", ["rewritten", "absent", "out_of_order", "too_far"])
+def test_excerpt_rejects_missing_reordered_or_distant_fragments(case):
+    first = "The coated steel coupon rested inside the chamber"
+    last = "while dry nitrogen flowed over the heated surface."
+    text = {
+        "rewritten": first + " as technicians adjusted the pressure valve near noon.",
+        "absent": "The operator rinsed the glass vial with cold water before weighing it.",
+        "out_of_order": last + " Fig. 1. " + first,
+        "too_far": first + " " * 801 + "Fig. 1. Sample holder.\n" + last,
+    }[case]
+
+    status, n_segments, n_verified, first_unverified = utils.check_excerpt(text, first + " " + last)
+
+    assert (status, n_segments, n_verified) == ("fail", 1, 0)
+    assert first_unverified
+
+
 def test_excerpt_checker_distinguishes_locations_and_checks_only_the_quote(tmp_path):
     script = Path(__file__).resolve().parents[1] / "evaluation" / "extraction" / "check_excerpts.py"
     location_only = 'Section 2.1 "Preparation of the MAO layer" (Experimental materials), text excerpt'
