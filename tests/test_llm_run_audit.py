@@ -100,6 +100,7 @@ def test_failed_plain_response_audit(make_automation, monkeypatch, path, raw, ex
 @pytest.mark.parametrize("representation", ["text", "tool_arguments", "unavailable"])
 def test_final_structured_failure_extracts_original_reply(make_automation, monkeypatch, representation):
     auto = make_automation()
+    calls = []
     provider_error = RuntimeError("fake structured failure")
     if representation == "text":
         message = SimpleNamespace(content="original text", tool_calls=[])
@@ -116,6 +117,7 @@ def test_final_structured_failure_extracts_original_reply(make_automation, monke
         provider_error.last_completion = SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
     def fail_structured(*args):
+        calls.append(args)
         raise LLMCallError("fake failure", category="unknown", retry_count=0, original_error=provider_error)
 
     monkeypatch.setattr(auto, "_generate_dynamic_schema", lambda: object())
@@ -125,6 +127,8 @@ def test_final_structured_failure_extracts_original_reply(make_automation, monke
     assert event["status"] == "error"
     assert event["failure_stage"] == "structured"
     assert event["raw_response"] == expected
+    assert event["parse_retry_count"] == 0
+    assert len(calls) == 1
 
 
 def test_success_event_has_no_raw_reply(make_automation, monkeypatch):
@@ -155,3 +159,110 @@ def test_fixed_cache_keys(make_automation):
     )
     assert screening["cache_key"] == "788354ed11512f6d510a339aff4494bcdfbc3a797fa3c79739192a2c360711ed"
     assert extraction["cache_key"] == "73cde48999a4d73506cc3d769423f67e5f6879a08887c10c528db3096a2744e8"
+
+
+@pytest.mark.parametrize(
+    "path, bad_response",
+    [
+        ("screen_article", ""),
+        ("screen_article", "not JSON " * 600),
+        ("screen_article", '{"decision":"Maybe"}'),
+        ("screen_article", '{"decision":["Likely Include"]}'),
+        ("screen_article", '{"decision":"Likely Include","reasoning":[]}'),
+        ("screen_article", '{"decision":"Likely Include","notes":3}'),
+        ("extract_data", ""),
+        ("extract_data", "not JSON"),
+    ],
+    ids=[
+        "screen-empty", "screen-json", "screen-decision", "screen-decision-type",
+        "screen-reasoning", "screen-notes", "extract-empty", "extract-json",
+    ],
+)
+@pytest.mark.parametrize("recovers", [True, False])
+def test_plain_parse_retry_uses_identical_request_and_keeps_first_reply(
+    make_automation, monkeypatch, path, bad_response, recovers
+):
+    auto = make_automation()
+    monkeypatch.setattr(auto, "_generate_dynamic_schema", lambda: None)
+    valid = '{"decision":"Likely Include"}' if path == "screen_article" else '{"coating_material":"TiN"}'
+    second = valid if recovers else "still not JSON"
+    replies = iter([(bad_response, 8), (second, 13)])
+    requests = []
+
+    def fake_call(messages, **parameters):
+        requests.append(json.dumps({"messages": messages, **parameters}, sort_keys=True))
+        return next(replies)
+
+    monkeypatch.setattr(auto, "_llm_call", fake_call)
+    result = getattr(auto, path)("paper", "paper.pdf")
+    event, = audit_rows(auto)
+    assert len(requests) == 2
+    assert requests[0] == requests[1]
+    assert event["parse_retry_count"] == 1
+    assert event["retry_count"] == 0
+    assert event["raw_response"] == bad_response[:4000]
+    assert event["api_tokens_used"] == result.api_tokens_used == auto.stats["total_api_tokens"] == 21
+    assert event["status"] == ("ok" if recovers else "error")
+    if path == "screen_article":
+        assert result.decision == ("Likely Include" if recovers else "Error")
+    else:
+        assert result.fields["coating_material"] == ("TiN" if recovers else "Error")
+    assert len(list(auto.cache_folder.glob("*.json"))) == int(recovers)
+
+
+@pytest.mark.parametrize("path", ["screen_article", "extract_data"])
+@pytest.mark.parametrize("category", ["timeout", "auth_error"])
+def test_provider_failure_does_not_trigger_parse_retry(make_automation, monkeypatch, path, category):
+    auto = make_automation()
+    monkeypatch.setattr(auto, "_generate_dynamic_schema", lambda: None)
+    calls = []
+
+    def fail_request(messages, **kwargs):
+        calls.append(messages)
+        raise LLMCallError(
+            "fake provider failure", category=category, retry_count=0, original_error=RuntimeError(),
+        )
+
+    monkeypatch.setattr(auto, "_llm_call", fail_request)
+    getattr(auto, path)("paper", "paper.pdf")
+    event, = audit_rows(auto)
+    assert len(calls) == 1
+    assert event["status"] == "error"
+    assert event["parse_retry_count"] == 0
+    assert event["raw_response"] is None
+    assert event["failure_stage"] == "request"
+    assert not list(auto.cache_folder.glob("*.json"))
+
+
+@pytest.mark.parametrize(
+    "path, raw",
+    [
+        ("screen_article", "[]"),
+        ("screen_article", '{"decision":"Likely Include","notes":"Malformed LLM response; raw response content was not stored."}'),
+        ("extract_data", "[]"),
+        ("extract_data", '{"other":"TiN"}'),
+    ],
+)
+def test_other_existing_plain_errors_do_not_trigger_parse_retry(make_automation, monkeypatch, path, raw):
+    auto = make_automation()
+    monkeypatch.setattr(auto, "_generate_dynamic_schema", lambda: None)
+    replies = iter([(raw, 2)])
+    monkeypatch.setattr(auto, "_llm_call", lambda *args, **kwargs: next(replies))
+    getattr(auto, path)("paper", "paper.pdf")
+    event, = audit_rows(auto)
+    assert event["status"] == "error"
+    assert event["parse_retry_count"] == 0
+    assert event["raw_response"] == raw
+
+
+def test_plain_extraction_still_accepts_non_string_fields(make_automation, monkeypatch):
+    auto = make_automation()
+    monkeypatch.setattr(auto, "_generate_dynamic_schema", lambda: None)
+    replies = iter([('{"coating_material":["TiN"],"coating_material_quote":7}', 2)])
+    monkeypatch.setattr(auto, "_llm_call", lambda *args, **kwargs: next(replies))
+    result = auto.extract_data("paper", "paper.pdf")
+    event, = audit_rows(auto)
+    assert result.fields == {"coating_material": ["TiN"], "coating_material_quote": 7}
+    assert event["status"] == "ok"
+    assert event["parse_retry_count"] == 0
+    assert "raw_response" not in event

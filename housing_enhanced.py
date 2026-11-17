@@ -32,6 +32,7 @@ from enum import Enum
 from version import VERSION as __version__
 
 CACHE_SCHEMA_VERSION = "3"
+PARSE_RETRY_LIMIT = 1
 _PDF_EXTRACTION_LOCK = threading.Lock()
 
 
@@ -155,6 +156,10 @@ class TextCacheMetadata:
 # Robust JSON parser
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _MalformedJSONResponse(dict):
+    """Identify the existing parser fallback without changing its fields."""
+
+
 def _parse_json_response(raw: str) -> Dict:
     """
     Extract JSON from an LLM response even when wrapped in markdown fences,
@@ -188,11 +193,11 @@ def _parse_json_response(raw: str) -> Dict:
             pass
 
     # Fallback so processing doesn't crash
-    return {
+    return _MalformedJSONResponse({
         "decision": ScreeningDecision.FLAG_FOR_HUMAN.value,
         "reasoning": "Could not parse LLM response as JSON.",
         "notes": "Malformed LLM response; raw response content was not stored."
-    }
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -533,6 +538,7 @@ class SystematicReviewAutomation:
         error: str = None,
         failure_stage: str = None,
         raw_response: Optional[str] = None,
+        parse_retry_count: int = 0,
     ):
         provider_profile = cache_context.get('provider_profile') or {}
         text_cache_metadata = self.get_paper_text_metadata(filename)
@@ -559,6 +565,7 @@ class SystematicReviewAutomation:
             'final_status': final_status or status,
             'parse_status': parse_status,
             'retry_count': retry_count,
+            'parse_retry_count': parse_retry_count,
             'rate_limit_wait_seconds': round(float(rate_limit_wait_seconds or 0.0), 6),
             'backoff_wait_seconds': round(float(backoff_wait_seconds or 0.0), 6),
         }
@@ -570,6 +577,7 @@ class SystematicReviewAutomation:
             event['error'] = error
         if failure_stage:
             event['failure_stage'] = failure_stage
+        if failure_stage or parse_retry_count:
             event['raw_response'] = raw_response[:4000] if isinstance(raw_response, str) else None
         self._append_audit_event(event)
 
@@ -1023,6 +1031,8 @@ class SystematicReviewAutomation:
         start = time.time()
         tokens = 0
         raw = None
+        first_failed_raw = None
+        parse_retry_count = 0
         cache_context = self._cache_key_context(
             kind='screening',
             text=text,
@@ -1058,19 +1068,38 @@ class SystematicReviewAutomation:
                 {"role": "system", "content": "You are a systematic review assistant. Only return valid JSON."},
                 {"role": "user",   "content": _render_paper_prompt(self.screening_prompt, snippet)},
             ]
-            failure_stage = 'request'
-            raw, tokens = self._llm_call(messages, temperature=self.temperature, max_tokens=min(1500, self.max_output_tokens))
-            with self._lock:
-                self.stats['total_api_tokens'] += tokens
-            llm_metadata = self._audit_llm_metadata()
-            failure_stage = 'parse'
-            data = _parse_json_response(raw)
-            failure_stage = 'validation'
-            if (data.get('decision') not in {d.value for d in ScreeningDecision if d != ScreeningDecision.ERROR}
-                    or data.get('notes') == 'Malformed LLM response; raw response content was not stored.'
-                    or any(not isinstance(data.get(name, ''), str) for name in ('reasoning', 'notes'))):
-                raise ValueError('Invalid screening response schema or decision')
+            for attempt in range(PARSE_RETRY_LIMIT + 1):
+                failure_stage = 'request'
+                raw, attempt_tokens = self._llm_call(
+                    messages, temperature=self.temperature, max_tokens=min(1500, self.max_output_tokens),
+                )
+                tokens += attempt_tokens
+                with self._lock:
+                    self.stats['total_api_tokens'] += attempt_tokens
+                failure_stage = 'parse'
+                try:
+                    data = _parse_json_response(raw)
+                except ValueError:
+                    empty = raw is None or (isinstance(raw, str) and not raw.strip())
+                    if not empty or attempt == PARSE_RETRY_LIMIT:
+                        raise
+                else:
+                    failure_stage = 'validation'
+                    invalid_schema = (
+                        data.get('decision') not in tuple(
+                            d.value for d in ScreeningDecision if d != ScreeningDecision.ERROR
+                        )
+                        or any(not isinstance(data.get(name, ''), str) for name in ('reasoning', 'notes'))
+                    )
+                    malformed_note = data.get('notes') == 'Malformed LLM response; raw response content was not stored.'
+                    if not (invalid_schema or malformed_note):
+                        break
+                    if attempt == PARSE_RETRY_LIMIT or not (invalid_schema or isinstance(data, _MalformedJSONResponse)):
+                        raise ValueError('Invalid screening response schema or decision')
+                first_failed_raw = raw
+                parse_retry_count += 1
 
+            llm_metadata = self._audit_llm_metadata()
             failure_stage = 'processing'
             result = ScreeningResult(
                 filename=filename,
@@ -1097,6 +1126,8 @@ class SystematicReviewAutomation:
                 cache_hit=False,
                 tokens=tokens,
                 decision=result.decision,
+                parse_retry_count=parse_retry_count,
+                raw_response=first_failed_raw,
                 **llm_metadata,
             )
             return result
@@ -1118,7 +1149,8 @@ class SystematicReviewAutomation:
                 error=safe_error,
                 tokens=tokens,
                 failure_stage=failure_stage,
-                raw_response=raw,
+                parse_retry_count=parse_retry_count,
+                raw_response=first_failed_raw if parse_retry_count else raw,
             )
             return ScreeningResult(
                 filename=filename,
@@ -1137,6 +1169,8 @@ class SystematicReviewAutomation:
         start = time.time()
         tokens = 0
         raw = None
+        first_failed_raw = None
+        parse_retry_count = 0
         cache_context = self._cache_key_context(
             kind='extraction',
             text=text,
@@ -1207,12 +1241,29 @@ class SystematicReviewAutomation:
 
             # Fallback: plain LLM call + regex JSON extraction
             if data is None:
-                failure_stage = 'request'
-                raw, tokens = self._llm_call(messages, temperature=self.temperature, max_tokens=self.max_output_tokens)
-                with self._lock:
-                    self.stats['total_api_tokens'] += tokens
-                failure_stage = 'parse'
-                data = _parse_json_response(raw)
+                for attempt in range(PARSE_RETRY_LIMIT + 1):
+                    failure_stage = 'request'
+                    raw, attempt_tokens = self._llm_call(
+                        messages, temperature=self.temperature, max_tokens=self.max_output_tokens,
+                    )
+                    tokens = tokens + attempt_tokens if attempt else attempt_tokens
+                    with self._lock:
+                        self.stats['total_api_tokens'] += attempt_tokens
+                    failure_stage = 'parse'
+                    try:
+                        data = _parse_json_response(raw)
+                    except ValueError:
+                        empty = raw is None or (isinstance(raw, str) and not raw.strip())
+                        if not empty or attempt == PARSE_RETRY_LIMIT:
+                            raise
+                    else:
+                        if (not isinstance(data, _MalformedJSONResponse)
+                                or attempt == PARSE_RETRY_LIMIT
+                                or any(f in data or f.lower().replace(' ', '_').replace('-', '_') in data
+                                       for f in self.extraction_fields)):
+                            break
+                    first_failed_raw = raw
+                    parse_retry_count += 1
             else:
                 with self._lock:
                     self.stats['total_api_tokens'] += tokens
@@ -1248,6 +1299,8 @@ class SystematicReviewAutomation:
                 cache_context=cache_context,
                 cache_hit=False,
                 tokens=tokens,
+                parse_retry_count=parse_retry_count,
+                raw_response=first_failed_raw,
                 **llm_metadata,
             )
             return result
@@ -1270,7 +1323,8 @@ class SystematicReviewAutomation:
                 error=safe_error,
                 tokens=tokens,
                 failure_stage=failure_stage,
-                raw_response=raw,
+                parse_retry_count=parse_retry_count,
+                raw_response=first_failed_raw if parse_retry_count else raw,
             )
             return ExtractionResult(
                 filename=filename,
