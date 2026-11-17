@@ -287,7 +287,11 @@ def test_reconcile_stale_automation_runs_is_idempotent_and_preserves_workspace_d
         table: _count(root, table)
         for table in preserved_counts
     } == preserved_counts
-    assert workspace_store.get_prisma_ready_counts(root) == prisma_before
+    prisma_after = workspace_store.get_prisma_ready_counts(root)
+    # Each snapshot has its own generation time.
+    prisma_before.pop("generated_at")
+    prisma_after.pop("generated_at")
+    assert prisma_after == prisma_before
     assert {path: path.read_bytes() for path in partial_files} == partial_files
 
 
