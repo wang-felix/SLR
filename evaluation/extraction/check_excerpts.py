@@ -1,7 +1,7 @@
 """Automatically check whether each 'source excerpt' in the extraction output really appears in the paper's PDF text.
 
 Usage:
-  python check_excerpts.py extraction_results.xlsx --pdf-dir <folder containing the PDFs, searched recursively> [--out excerpt_check.csv]
+  python check_excerpts.py extraction_results.xlsx --pdf-dir <folder containing the PDFs, searched recursively> [--excerpt-column COLUMN] [--out excerpt_check.csv]
 The PDFs must be findable by the Filename in the extraction table (SLR stores uploads under those hashed names).
 The source field accepts "verbatim quote || location" or "NOT_FOUND".
 Statuses: pass (all segments found), partial, fail (no segment matched), language_mismatch,
@@ -9,18 +9,25 @@ no_excerpt, too_short, pdf_missing, not_found, location_only.
 """
 import argparse
 import pandas as pd
-from extraction_utils import (read_table, pick_col, load_pdf_text, index_pdfs, norm_search,
+from extraction_utils import (read_table, pick_col, norm_col, load_pdf_text, index_pdfs, norm_search,
                               parse_excerpt_field, check_excerpt, wilson)
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("extraction"); ap.add_argument("--pdf-dir", required=True)
-    ap.add_argument("--col-excerpt", default="source_section_table_or_text_excerpt")
+    ap.add_argument(
+        "--excerpt-column", "--col-excerpt", metavar="COLUMN",
+        default="source_section_table_or_text_excerpt",
+        help="Column containing the source quote (default: %(default)s)",
+    )
     ap.add_argument("--out", default="excerpt_check.csv")
     a = ap.parse_args()
     df = read_table(a.extraction)
     fcol = pick_col(df, "filename", ["filename"], "filename")
-    ecol = pick_col(df, a.col_excerpt, ["excerpt", "source"], "source excerpt")
+    ecol = norm_col(a.excerpt_column)
+    if ecol not in df.columns:
+        available_columns = ", ".join(df.columns)
+        ap.error(f"excerpt column {a.excerpt_column!r} not found; available columns: {available_columns}")
     idx = index_pdfs(a.pdf_dir); cache = {}; rows = []
     for _, r in df.iterrows():
         name = str(r[fcol]); key = name.lower()

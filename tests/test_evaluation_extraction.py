@@ -149,6 +149,38 @@ def test_excerpt_checker_distinguishes_locations_and_checks_only_the_quote(tmp_p
 
 
 @pytest.mark.parametrize(
+    ("use_new_column", "old_excerpt", "new_excerpt", "expected_status"),
+    [
+        (True, "NOT_FOUND", "The coating remained intact.", "pass"),
+        (True, "The coating remained intact.", "NOT_FOUND", "not_found"),
+        (False, "The coating remained intact.", "NOT_FOUND", "pass"),
+    ],
+    ids=["select-new-column", "not-found-in-new-column", "default-to-old-column"],
+)
+def test_excerpt_checker_selects_the_requested_column(
+    tmp_path, use_new_column, old_excerpt, new_excerpt, expected_status,
+):
+    script = Path(__file__).resolve().parents[1] / "evaluation" / "extraction" / "check_excerpts.py"
+    new_column = "source_verbatim_quote_copied_exactly_in_original_language_or_NOT_FOUND"
+    table = tmp_path / "extraction.csv"
+    pd.DataFrame({
+        "Filename": ["synthetic.pdf"],
+        "Source Section Table or Text Excerpt": [old_excerpt],
+        new_column: [new_excerpt],
+        "source_section_number_and_title": ["Section 2.1 Test procedure"],
+    }).to_csv(table, index=False)
+    (tmp_path / "synthetic.txt").write_text("The coating remained intact.", encoding="utf-8")
+
+    command = [sys.executable, str(script), str(table), "--pdf-dir", str(tmp_path)]
+    if use_new_column:
+        command.extend(["--excerpt-column", new_column])
+    subprocess.run(command, cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    checked = pd.read_csv(tmp_path / "excerpt_check.csv")
+    assert checked["status"].tolist() == [expected_status]
+
+
+@pytest.mark.parametrize(
     ("reference", "expected_score"),
     [("氧化铝", "exact"), ("氧化物陶瓷", "review")],
 )

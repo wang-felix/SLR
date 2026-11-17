@@ -17,9 +17,15 @@
 
 ### 原文出处字段
 
-抽取结果中的 `Source Section Table or Text Excerpt` 使用 `原文引句 || 章节位置`，分隔符两侧各有一个空格。引句逐字引用论文原文，`||` 后可写章节、表格或图的位置。找不到可引用句子时，整个字段写 `NOT_FOUND`。
+新导出的原文引句列是 `source_verbatim_quote_copied_exactly_in_original_language_or_NOT_FOUND`，位置单独记录在 `source_section_number_and_title`。校验时用 `--excerpt-column` 指定引句列。位置列不参与匹配。找不到可引用句子时，引句列填 `NOT_FOUND`。
 
-`excerpt_check.csv` 的 `location` 列记录位置说明，脚本只用 `||` 前的引句匹配 PDF 文字。旧结果没有分隔符时，以 `Section`、`Sec.`、`Table`、`Fig`（含 `Figure`）或 `§` 开头的字段按位置说明处理，忽略大小写。其他旧字段仍按原规则匹配。
+```text
+python check_excerpts.py extraction_results.xlsx --pdf-dir pdfs --excerpt-column source_verbatim_quote_copied_exactly_in_original_language_or_NOT_FOUND --out excerpt_check.csv
+```
+
+省略 `--excerpt-column` 时默认读取旧列 `source_section_table_or_text_excerpt`（`Source Section Table or Text Excerpt`）。`--col-excerpt` 仍可作为旧参数名使用。指定的引句列缺失时，脚本会报错并列出可用列名。
+
+旧字段支持 `原文引句 || 章节位置`，分隔符两侧各有一个空格。脚本只匹配 `||` 前的引句，并把分隔符后的说明保存到 `excerpt_check.csv` 的 `location` 列。旧结果没有分隔符时，以 `Section`、`Sec.`、`Table`、`Fig`（含 `Figure`）或 `§` 开头的字段按位置说明处理，忽略大小写。其他旧字段仍按原规则匹配。
 
 | 状态 | 含义 |
 | --- | --- |
