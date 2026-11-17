@@ -960,6 +960,18 @@ def test_workspace_abstract_screening_persists_ai_suggestion_only(isolated_webap
     assert "sk-not-stored" not in _db_dump(root)
 
 
+def test_processing_audit_metadata_skips_run_config(tmp_path):
+    path = tmp_path / "audit.jsonl"
+    screening = {"kind": "screening", "filename": "paper.pdf", "stage": "Full-text"}
+    path.write_text(
+        json.dumps({"kind": "run_config", "screening_prompt": "exact template"}) + "\n"
+        + json.dumps(screening) + "\n",
+        encoding="utf-8",
+    )
+    auto = SimpleNamespace(audit_ledger=path)
+    assert processing_service.processing_audit_metadata(auto) == {("paper.pdf", "full_text"): screening}
+
+
 def test_workspace_full_text_processing_results_persist_ai_suggestion(isolated_webapp, tmp_path):
     client = isolated_webapp.app.test_client()
     root = tmp_path / "workspace"

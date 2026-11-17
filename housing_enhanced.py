@@ -199,6 +199,34 @@ def _parse_json_response(raw: str) -> Dict:
 # Main Automation Class
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _structured_error_response(error: Exception) -> Optional[str]:
+    while error is not None:
+        completion = getattr(error, 'last_completion', None)
+        if completion is not None:
+            choices = getattr(completion, 'choices', None)
+            if choices:
+                message = getattr(choices[0], 'message', None)
+                arguments = [
+                    call.function.arguments for call in (getattr(message, 'tool_calls', None) or [])
+                    if isinstance(getattr(getattr(call, 'function', None), 'arguments', None), str)
+                ]
+                if arguments:
+                    return '\n'.join(arguments)
+                content = getattr(message, 'content', None)
+                return content if isinstance(content, str) else None
+
+            content = getattr(completion, 'content', None)
+            if isinstance(content, str):
+                return content
+            text_parts = [
+                block.text for block in (content or [])
+                if isinstance(getattr(block, 'text', None), str)
+            ]
+            return ''.join(text_parts) if text_parts else None
+        error = getattr(error, 'original_error', None) or error.__cause__
+    return None
+
+
 class SystematicReviewAutomation:
 
     def __init__(
@@ -503,6 +531,8 @@ class SystematicReviewAutomation:
         rate_limit_wait_seconds: float = 0.0,
         backoff_wait_seconds: float = 0.0,
         error: str = None,
+        failure_stage: str = None,
+        raw_response: Optional[str] = None,
     ):
         provider_profile = cache_context.get('provider_profile') or {}
         text_cache_metadata = self.get_paper_text_metadata(filename)
@@ -538,6 +568,36 @@ class SystematicReviewAutomation:
             event['text_cache'] = text_cache_metadata
         if error:
             event['error'] = error
+        if failure_stage:
+            event['failure_stage'] = failure_stage
+            event['raw_response'] = raw_response[:4000] if isinstance(raw_response, str) else None
+        self._append_audit_event(event)
+
+    def _write_run_config(self):
+        provider_profile = self._provider_cache_metadata()
+        extraction = {'plain_json': {'temperature': self.temperature, 'max_tokens': self.max_output_tokens}}
+        adapter = getattr(self.llm_manager, 'profile', {}).get('adapter')
+        if adapter in ('native_openai', 'openai_compatible', 'native_ollama', 'native_anthropic'):
+            extraction['structured'] = {
+                'temperature': '未传' if adapter == 'native_anthropic' else self.temperature,
+                'max_tokens': self.max_output_tokens,
+            }
+        self._append_audit_event({
+            'kind': 'run_config',
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'app_version': __version__,
+            'pipeline_version': __version__,
+            'provider': provider_profile['provider'],
+            'model': provider_profile['model'],
+            'base_url': provider_profile['base_url'],
+            'screening_prompt': self.screening_prompt,
+            'extraction_prompt': self.extraction_prompt,
+            'extraction_fields': self.extraction_fields,
+            'screening': {'temperature': self.temperature, 'max_tokens': min(1500, self.max_output_tokens)},
+            'extraction': extraction,
+        })
+
+    def _append_audit_event(self, event: Dict[str, Any]):
         try:
             with self._audit_lock:
                 with open(self.audit_ledger, 'a', encoding='utf-8') as f:
@@ -744,12 +804,12 @@ class SystematicReviewAutomation:
             self._llm_thread_local.metadata = getter()
         return dict(getattr(self._llm_thread_local, 'metadata', {}))
 
-    def _audit_llm_metadata(self) -> Dict[str, Any]:
+    def _audit_llm_metadata(self, default_error_category: str = None) -> Dict[str, Any]:
         metadata = dict(getattr(self._llm_thread_local, 'metadata', {}))
         return {
             'retry_count': int(metadata.get('retry_count', 0) or 0),
             'final_status': metadata.get('final_status'),
-            'error_category': metadata.get('error_category'),
+            'error_category': metadata.get('error_category') or default_error_category,
             'rate_limit_wait_seconds': float(metadata.get('rate_limit_wait_seconds', 0.0) or 0.0),
             'backoff_wait_seconds': float(metadata.get('backoff_wait_seconds', 0.0) or 0.0),
         }
@@ -962,6 +1022,7 @@ class SystematicReviewAutomation:
     def screen_article(self, text: str, filename: str, stage: str = "Full-text") -> ScreeningResult:
         start = time.time()
         tokens = 0
+        raw = None
         cache_context = self._cache_key_context(
             kind='screening',
             text=text,
@@ -986,6 +1047,7 @@ class SystematicReviewAutomation:
             )
             return result
 
+        failure_stage = 'processing'
         try:
             snippet = (
                 text[:self.two_stage_chars]  # title/abstract only for stage-1
@@ -996,16 +1058,20 @@ class SystematicReviewAutomation:
                 {"role": "system", "content": "You are a systematic review assistant. Only return valid JSON."},
                 {"role": "user",   "content": _render_paper_prompt(self.screening_prompt, snippet)},
             ]
+            failure_stage = 'request'
             raw, tokens = self._llm_call(messages, temperature=self.temperature, max_tokens=min(1500, self.max_output_tokens))
             with self._lock:
                 self.stats['total_api_tokens'] += tokens
             llm_metadata = self._audit_llm_metadata()
+            failure_stage = 'parse'
             data = _parse_json_response(raw)
+            failure_stage = 'validation'
             if (data.get('decision') not in {d.value for d in ScreeningDecision if d != ScreeningDecision.ERROR}
                     or data.get('notes') == 'Malformed LLM response; raw response content was not stored.'
                     or any(not isinstance(data.get(name, ''), str) for name in ('reasoning', 'notes'))):
                 raise ValueError('Invalid screening response schema or decision')
 
+            failure_stage = 'processing'
             result = ScreeningResult(
                 filename=filename,
                 decision=data.get("decision", ScreeningDecision.FLAG_FOR_HUMAN.value),
@@ -1048,9 +1114,11 @@ class SystematicReviewAutomation:
                 cache_hit=False,
                 status='error',
                 parse_status='error',
-                **self._audit_llm_metadata(),
+                **self._audit_llm_metadata(type(e).__name__),
                 error=safe_error,
                 tokens=tokens,
+                failure_stage=failure_stage,
+                raw_response=raw,
             )
             return ScreeningResult(
                 filename=filename,
@@ -1068,6 +1136,7 @@ class SystematicReviewAutomation:
     def extract_data(self, text: str, filename: str) -> ExtractionResult:
         start = time.time()
         tokens = 0
+        raw = None
         cache_context = self._cache_key_context(
             kind='extraction',
             text=text,
@@ -1091,6 +1160,7 @@ class SystematicReviewAutomation:
             )
             return result
 
+        failure_stage = 'processing'
         try:
             chunk = self._smart_truncate(text, self.max_text_chars)
 
@@ -1122,6 +1192,7 @@ class SystematicReviewAutomation:
             data, tokens = None, 0
             if schema is not None:
                 try:
+                    failure_stage = 'structured'
                     structured, tokens = self._llm_structured_call(messages, schema)
                     if structured is not None:
                         data = structured.model_dump()
@@ -1136,19 +1207,23 @@ class SystematicReviewAutomation:
 
             # Fallback: plain LLM call + regex JSON extraction
             if data is None:
+                failure_stage = 'request'
                 raw, tokens = self._llm_call(messages, temperature=self.temperature, max_tokens=self.max_output_tokens)
                 with self._lock:
                     self.stats['total_api_tokens'] += tokens
+                failure_stage = 'parse'
                 data = _parse_json_response(raw)
             else:
                 with self._lock:
                     self.stats['total_api_tokens'] += tokens
             llm_metadata = self._audit_llm_metadata()
+            failure_stage = 'validation'
             if not isinstance(data, dict) or not any(
                 f in data or f.lower().replace(' ', '_').replace('-', '_') in data
                 for f in self.extraction_fields
             ):
                 raise ValueError('Invalid extraction response schema')
+            failure_stage = 'processing'
             for f in self.extraction_fields:
                 safe = f.lower().replace(' ', '_').replace('-', '_')
                 data[f] = data.get(safe, data.get(f, 'Not reported'))
@@ -1182,6 +1257,8 @@ class SystematicReviewAutomation:
         except Exception as e:
             safe_error = str(e) if isinstance(e, LLMCallError) else f"Extraction failed ({type(e).__name__})"
             self.logger.error(f"Extraction error {filename}: {safe_error}")
+            if failure_stage == 'structured':
+                raw = _structured_error_response(e)
             self._write_audit_event(
                 kind='extraction',
                 filename=filename,
@@ -1189,9 +1266,11 @@ class SystematicReviewAutomation:
                 cache_hit=False,
                 status='error',
                 parse_status='error',
-                **self._audit_llm_metadata(),
+                **self._audit_llm_metadata(type(e).__name__),
                 error=safe_error,
                 tokens=tokens,
+                failure_stage=failure_stage,
+                raw_response=raw,
             )
             return ExtractionResult(
                 filename=filename,
@@ -1263,6 +1342,7 @@ class SystematicReviewAutomation:
             with self._lock:
                 for key in self.stats:
                     self.stats[key] = '' if key == 'current_file' else 0
+            self._write_run_config()
             return self._process_batch()
         finally:
             self._run_lock.release()
