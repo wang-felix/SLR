@@ -103,10 +103,13 @@ def main():
         L += [f"- 状态分布:{vc}"]
         if n:
             L += [f"- 完全核实:{pct(int((chk.status == 'pass').sum()), n)}",
-                  f"- 完全找不到(疑似编造):{pct(int((chk.status == 'fail').sum()), n)}",
+                  f"- 未在 PDF 文字中找到:{pct(int((chk.status == 'fail').sum()), n)}",
                   f"- 未完全核实(部分或找不到):{pct(int((chk.status != 'pass').sum()), n)}"]
-        L += ["- language_mismatch 表示引句语言与论文不同,模型多半是翻译而非逐字引用;pdf_missing 表示没找到对应 PDF,不计入。",
-              "- 「找不到」也可能来自 PDF 转文字的差异(表格、公式、连字符),请先看 excerpt_check.csv 的 first_unverified_segment 再下结论。", ""]
+        else:
+            L += ["- 本次没有可计分的引句，匹配比例不适用。"]
+        L += ["- 匹配比例仅统计 pass、partial、fail。not_found 表示字段声明找不到可引用句子，location_only 表示字段只有位置说明，两者单独计数。",
+              "- language_mismatch 表示引句语言与论文不同，pdf_missing 表示没找到对应 PDF。",
+              "- 未匹配可能来自 PDF 转文字的差异（表格、公式、连字符），也可能是字段内容并非引句。请结合 excerpt_check.csv 的 first_unverified_segment 与 PDF 原文复核。", ""]
     else:
         L += ["未提供 --excerpt-check,先运行 check_excerpts.py 生成 excerpt_check.csv。", ""]
     L += ["## 解读提示", "", "样本小,区间会很宽;结论应连同区间一起汇报。人工答案由一人完成,没有标注者之间的一致性检验。"]

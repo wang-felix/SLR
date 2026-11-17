@@ -172,6 +172,21 @@ def classify_method(text):
 
 # ---------- source excerpt check ----------
 _CJK = re.compile(r"[\u4e00-\u9fff]")
+_LOCATION_PREFIX = re.compile(r"^(?:(?:section|table|fig(?:ure)?)\b|sec\.|§)", re.IGNORECASE)
+
+
+def parse_excerpt_field(value):
+    """Return (quote, location, status); status is None for text to check."""
+    text = "" if is_missing(value) else str(value)
+    quote, separator, location = text.partition(" || ")
+    if separator:
+        return quote.strip(), location.strip(), None
+    text = text.strip()
+    if text == "NOT_FOUND":
+        return "", "", "not_found"
+    if _LOCATION_PREFIX.match(text):
+        return "", text, "location_only"
+    return text, "", None
 
 def norm_search(s):
     s = unicodedata.normalize("NFKC", str(s)).lower()

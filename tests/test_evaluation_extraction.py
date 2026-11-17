@@ -123,6 +123,31 @@ def test_excerpt_status(excerpt, status, verified):
     assert bool(result[3]) == (status != "pass")
 
 
+def test_excerpt_checker_distinguishes_locations_and_checks_only_the_quote(tmp_path):
+    script = Path(__file__).resolve().parents[1] / "evaluation" / "extraction" / "check_excerpts.py"
+    location_only = 'Section 2.1 "Preparation of the MAO layer" (Experimental materials), text excerpt'
+    quote = "The oxide layer remained intact."
+    location = "Section 2.1 xxx"
+    table = tmp_path / "extraction.csv"
+    pd.DataFrame(
+        {
+            "Filename": ["location.pdf", "not_found.pdf", "quote.pdf"],
+            "Source Section Table or Text Excerpt": [location_only, "NOT_FOUND", f"{quote} || {location}"],
+        }
+    ).to_csv(table, index=False)
+    (tmp_path / "quote.txt").write_text(f"After immersion, the sample was inspected. {quote}", encoding="utf-8")
+
+    subprocess.run(
+        [sys.executable, str(script), str(table), "--pdf-dir", str(tmp_path)],
+        cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+
+    checked = pd.read_csv(tmp_path / "excerpt_check.csv", keep_default_na=False)
+    assert checked["status"].tolist() == ["location_only", "not_found", "pass"]
+    assert checked["location"].tolist() == [location_only, "", location]
+    assert checked["n_segments"].tolist() == checked["n_verified"].tolist() == [0, 0, 1]
+
+
 @pytest.mark.parametrize(
     ("reference", "expected_score"),
     [("氧化铝", "exact"), ("氧化物陶瓷", "review")],

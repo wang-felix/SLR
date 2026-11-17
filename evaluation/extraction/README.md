@@ -15,6 +15,25 @@
 依赖:pandas、openpyxl;读 PDF 优先用 pymupdf4llm(与 SLR 一致),没有则退回 pdfplumber。
 制备方法的归类规则在 `extraction_utils.py` 的 `METHOD_RULES`,可按你的领域增删关键词。
 
+### 原文出处字段
+
+抽取结果中的 `Source Section Table or Text Excerpt` 使用 `原文引句 || 章节位置`，分隔符两侧各有一个空格。引句逐字引用论文原文，`||` 后可写章节、表格或图的位置。找不到可引用句子时，整个字段写 `NOT_FOUND`。
+
+`excerpt_check.csv` 的 `location` 列记录位置说明，脚本只用 `||` 前的引句匹配 PDF 文字。旧结果没有分隔符时，以 `Section`、`Sec.`、`Table`、`Fig`（含 `Figure`）或 `§` 开头的字段按位置说明处理，忽略大小写。其他旧字段仍按原规则匹配。
+
+| 状态 | 含义 |
+| --- | --- |
+| `pass` | 所有引句片段匹配。 |
+| `partial` | 部分引句片段匹配。 |
+| `fail` | 所有引句片段均未在 PDF 转出的文字中匹配。 |
+| `language_mismatch` | 脚本检测到引句与 PDF 文字语言不一致。 |
+| `pdf_missing` | 需要核对文本时，未找到与记录对应的 PDF。 |
+| `not_found` | 整个字段为 `NOT_FOUND`。 |
+| `location_only` | 旧字段只给了位置说明，该说明保存在 `location` 列。 |
+| `no_excerpt` / `too_short` | 引句为空，或切分后没有足够长的片段。 |
+
+匹配比例仅统计 `pass`、`partial`、`fail`。`not_found` 和 `location_only` 单独计数。复核未匹配的结果时，可用 `first_unverified_segment` 回查 PDF 原文。
+
 ### 涂层材料评分
 
 每篇先识别两边的材料组分，统一化学式下标及已收录的同义词。脚本保留含小数或有括号的化学式，并排除能由句式明确识别的基材和电解液配方。材料字段明确声明的添加组分仍参与比较。
