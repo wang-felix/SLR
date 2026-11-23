@@ -1,7 +1,8 @@
+import hashlib
 import io
 import json
 import threading
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
@@ -663,6 +664,60 @@ def test_processing_contract_outputs_do_not_leak_sensitive_inputs(
     _assert_no_sentinels(results)
     _assert_no_sentinels(_processing_runtime(isolated_webapp).progress)
     _assert_no_sentinels(rows[0]["metadata_json"])
+
+
+def test_workspace_full_text_duplicates_preserve_contract_and_path_privacy(
+    isolated_webapp, tmp_path, monkeypatch,
+):
+    client = isolated_webapp.app.test_client()
+    root = tmp_path / "workspace"
+    _create_workspace(client, root)
+    names = sorted([
+        _upload_workspace_pdf(client, "First.pdf"),
+        _upload_workspace_pdf(client, "Second.pdf"),
+    ], key=str.lower)
+    text = SENSITIVE_SENTINELS[-1]
+    offline_model = SimpleNamespace(
+        profile={},
+        chat_completion_with_tokens=lambda *args, **kwargs: (
+            '{"decision":"Likely Exclude","reasoning":"fixture","notes":""}', 2,
+        ),
+    )
+    automation = isolated_webapp.SystematicReviewAutomation
+    monkeypatch.setattr(automation, "_init_llm", lambda self: offline_model)
+    monkeypatch.setattr(automation, "_extract_pdf_text", lambda self, path: (text, True))
+
+    start = client.post("/api/processing/start", json={"provider": "Fake", "model": "offline"})
+    assert start.status_code == 200
+    assert start.get_json() == {"status": "started", "total": 2}
+    _join_processing_thread(isolated_webapp)
+
+    status = client.get("/api/processing/status").get_json()
+    results = client.get("/api/processing/results").get_json()
+    expected = {
+        "files_with_text": 2, "unique_text_count": 1, "duplicate_group_count": 1,
+        "duplicate_extra_file_count": 1,
+        "groups": [{
+            "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "count": 2,
+            "filenames": names,
+        }],
+    }
+    for payload in (status, results):
+        assert payload["error"] == ""
+        assert payload["report_errors"] == []
+        assert set(payload["reports"]) == REPORT_KEYS
+        assert payload["counters"] == dict(ZERO_COUNTERS, total_files=2, processed_files=2, excluded=2)
+        duplicates = payload["summary"]["full_text_duplicates"]
+        assert duplicates == expected
+        for filename in duplicates["groups"][0]["filenames"]:
+            assert not Path(filename).is_absolute()
+            assert not PureWindowsPath(filename).anchor
+        assert root.as_posix() not in json.dumps(duplicates)
+        assert json.dumps(str(root))[1:-1] not in json.dumps(duplicates)
+        _assert_no_sentinels(payload)
+    assert sorted((row["filename"] for row in results["screening"]), key=str.lower) == names
+    assert len(_automation_run_rows(root)) == 1
 
 
 def test_job_admission_is_atomic_for_simultaneous_attempts():

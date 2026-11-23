@@ -379,6 +379,7 @@ class SystematicReviewAutomation:
         self._paper_texts:       Dict[str, str]         = {}  # legacy compatibility; not populated
         self._paper_text_metadata: Dict[str, Dict[str, Any]] = {}
         self._last_text_extraction_metadata: Dict[str, Dict[str, Any]] = {}
+        self._batch_text_hashes: Dict[Path, Optional[Tuple[str, str]]] = {}
         self._last_llm_call_metadata: Dict[str, Any] = {}
         self._llm_thread_local = threading.local()
 
@@ -754,16 +755,17 @@ class SystematicReviewAutomation:
             extracted_char_count=len(text),
             page_count=extraction_metadata.get('page_count'),
         )
-        self._paper_text_metadata[filename] = asdict(metadata)
+        metadata_dict = asdict(metadata)
+        self._paper_text_metadata[filename] = metadata_dict
         metadata_path = self.text_cache_folder / f"{text_hash}.json"
         try:
             atomic_write_text(metadata_path,
-                _canonical_json(self._paper_text_metadata[filename]),
+                _canonical_json(metadata_dict),
                 encoding='utf-8',
             )
         except Exception as e:
             self.logger.warning(f"Text cache metadata write failed ({filename}): {e}")
-        return dict(self._paper_text_metadata[filename])
+        return dict(metadata_dict)
 
     def _record_paper_text_failure(
         self,
@@ -1373,7 +1375,11 @@ class SystematicReviewAutomation:
         extraction_metadata = self._last_text_extraction_metadata.get(pdf_name, {})
 
         if ok:
-            self._store_paper_text_cache(pdf_name, text, extraction_metadata)
+            text_cache = self._store_paper_text_cache(pdf_name, text, extraction_metadata)
+            if text.strip():
+                with self._lock:
+                    if pdf_file in self._batch_text_hashes:
+                        self._batch_text_hashes[pdf_file] = (pdf_name, text_cache['text_hash'])
 
         if not ok:
             self._record_paper_text_failure(pdf_name, extraction_metadata)
@@ -1419,6 +1425,7 @@ class SystematicReviewAutomation:
             self._paper_text_metadata.clear()
             self._last_text_extraction_metadata.clear()
             with self._lock:
+                self._batch_text_hashes.clear()
                 for key in self.stats:
                     self.stats[key] = '' if key == 'current_file' else 0
             self._write_run_config()
@@ -1430,6 +1437,8 @@ class SystematicReviewAutomation:
         pdf_files = self._discover_pdf_files()
         with self._lock:
             self.stats['total_files'] = len(pdf_files)
+            # Preserve discovery order even when workers finish out of order.
+            self._batch_text_hashes = dict.fromkeys(pdf_files)
 
         if not pdf_files:
             scope = " or its subfolders" if self.include_subfolders else ""
@@ -1657,6 +1666,22 @@ class SystematicReviewAutomation:
     def _generate_summary(self) -> Dict:
         with self._lock:
             s = self.stats.copy()
+            paper_hashes = [entry for entry in self._batch_text_hashes.values() if entry is not None]
+        filenames_by_hash: Dict[str, List[str]] = {}
+        for filename, text_hash in paper_hashes:
+            filenames_by_hash.setdefault(text_hash, []).append(filename)
+        duplicate_groups = [
+            {"text_hash": text_hash, "count": len(filenames), "filenames": filenames}
+            for text_hash, filenames in filenames_by_hash.items()
+            if len(filenames) >= 2
+        ]
+        duplicates = {
+            "files_with_text": len(paper_hashes),
+            "unique_text_count": len(filenames_by_hash),
+            "duplicate_group_count": len(duplicate_groups),
+            "duplicate_extra_file_count": len(paper_hashes) - len(filenames_by_hash),
+            "groups": duplicate_groups,
+        }
         # Scientific/run counters describe final paper outcomes, not stage calls.
         for key in ('likely_include', 'likely_exclude', 'flag_for_review', 'flag_for_human_review', 'error'):
             s[key] = sum(r.decision.lower().replace(' ', '_') == key for r in self.screening_results)
@@ -1680,7 +1705,8 @@ class SystematicReviewAutomation:
                 "flagged":    s.get('flag_for_review', 0) + s.get('flag_for_human_review', 0),
                 "errors":     s.get('failed_files', 0),
                 "extracted":  len(self.extraction_results),
-            }
+            },
+            "full_text_duplicates": duplicates,
         }
 
         t = s['total_processing_time']
@@ -1708,6 +1734,16 @@ class SystematicReviewAutomation:
                 f.write(f"  Total time            : {t:.1f}s\n")
                 f.write(f"  Avg per file          : {summary['statistics'].get('avg_time_per_file', 0):.1f}s\n")
                 f.write(f"  API tokens used       : {s['total_api_tokens']:,}\n\n")
+                f.write("FULL-TEXT DUPLICATES\n")
+                f.write(f"  Files with text       : {duplicates['files_with_text']}\n")
+                f.write(f"  Unique texts          : {duplicates['unique_text_count']}\n")
+                f.write(f"  Duplicate groups      : {duplicates['duplicate_group_count']}\n")
+                f.write(f"  Extra duplicate files : {duplicates['duplicate_extra_file_count']}\n")
+                for group in duplicate_groups:
+                    f.write(f"  {group['text_hash'][:12]} ({group['count']} files)\n")
+                    for filename in group['filenames']:
+                        f.write(f"    {filename}\n")
+                f.write("\n")
                 f.write("OUTPUT FILES\n")
                 output_keys = ['screening_csv', 'screening_excel']
                 if self.extraction_results:
