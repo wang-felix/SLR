@@ -100,7 +100,11 @@ def test_identical_text_is_reported_without_changing_model_calls_or_rows(
             "filename", "material", "processing_time", "api_tokens_used",
         ]),
     )
+    metadata_headers = [
+        "input_text_chars", "prepared_text_chars", "text_truncated", "text_limit_chars", "text_input_state",
+    ]
     for csv_path, xlsx_path, headers in reports:
+        headers = headers + metadata_headers
         with csv_path.open(encoding="utf-8", newline="") as stream:
             reader = csv.DictReader(stream)
             assert reader.fieldnames == headers
@@ -122,7 +126,7 @@ def test_identical_text_is_reported_without_changing_model_calls_or_rows(
         "  Extra duplicate files : 2\n"
         f"  {group['text_hash'][:12]} (3 files)\n"
         "    a.pdf\n    b.pdf\n    c.pdf\n\n"
-        "OUTPUT FILES\n"
+        "TEXT TRUNCATION\n"
     ) in report
 
 

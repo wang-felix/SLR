@@ -27,7 +27,7 @@ from atomic_files import atomic_output, atomic_write_text, atomic_open
 from llm_interface import LLMManager, LLMCallError
 from spreadsheet_safety import csv_row, literal_workbook
 from url_privacy import redact_url
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, fields
 from enum import Enum
 from version import VERSION as __version__
 
@@ -117,8 +117,20 @@ class ScreeningDecision(Enum):
     ERROR           = "Error"
 
 
+@dataclass(kw_only=True)
+class TextInputMetadata:
+    input_text_chars: Optional[int] = None
+    prepared_text_chars: Optional[int] = None
+    text_truncated: Optional[bool] = None
+    text_limit_chars: Optional[int] = None
+    text_input_state: str = ""
+
+
+TEXT_INPUT_COLUMNS = tuple(column.name for column in fields(TextInputMetadata))
+
+
 @dataclass
-class ScreeningResult:
+class ScreeningResult(TextInputMetadata):
     filename:        str
     decision:        str
     reasoning:       str
@@ -130,7 +142,7 @@ class ScreeningResult:
 
 
 @dataclass
-class ExtractionResult:
+class ExtractionResult(TextInputMetadata):
     """
     Dynamic extraction result — fields dict holds user-defined columns.
     No hardcoded domain-specific fields.
@@ -387,6 +399,7 @@ class SystematicReviewAutomation:
         self._lock = threading.Lock()
         self._run_lock = threading.Lock()
         self._audit_lock = threading.Lock()
+        self._text_input_counts = self._new_text_input_counts()
         self.stats = {
             'total_files':         0,
             'processed_files':     0,
@@ -533,6 +546,7 @@ class SystematicReviewAutomation:
         filename: str,
         cache_context: Dict[str, Any],
         cache_hit: bool,
+        text_input: TextInputMetadata,
         stage: str = None,
         tokens: int = 0,
         decision: str = None,
@@ -552,6 +566,8 @@ class SystematicReviewAutomation:
     ):
         provider_profile = cache_context.get('provider_profile') or {}
         text_cache_metadata = self.get_paper_text_metadata(filename)
+        audit_text_input = asdict(text_input)
+        audit_text_input['state'] = audit_text_input.pop('text_input_state')
         event = {
             'timestamp': datetime.now().isoformat(timespec='seconds'),
             'schema_version': CACHE_SCHEMA_VERSION,
@@ -561,6 +577,7 @@ class SystematicReviewAutomation:
             'filename': filename,
             'stage': stage,
             'cache_hit': cache_hit,
+            'text_input': audit_text_input,
             'cache_key': cache_context.get('cache_key'),
             'text_hash': cache_context.get('text_hash'),
             'provider': provider_profile.get('provider'),
@@ -825,6 +842,39 @@ class SystematicReviewAutomation:
                 result += '\n\n' + p
         return (result or text)[:max_chars]
 
+    def _text_input_limits(self) -> Dict[str, int]:
+        return {
+            'title_abstract': self.two_stage_chars,
+            'full_text': self.max_text_chars,
+            'extraction': self.max_text_chars,
+        }
+
+    def _new_text_input_counts(self) -> Dict[str, Dict[str, int]]:
+        return {
+            stage: {'prepared_count': 0, 'truncated_count': 0, 'cache_hit_count': 0}
+            for stage in self._text_input_limits()
+        }
+
+    def _prepare_text_input(
+        self, text: str, stage: str, metadata: TextInputMetadata, *, cache_hit: bool = False,
+    ) -> str:
+        if cache_hit:
+            metadata.text_input_state = 'cache_hit'
+            with self._lock:
+                self._text_input_counts[stage]['cache_hit_count'] += 1
+            return ""
+
+        limit = self._text_input_limits()[stage]
+        prepared = text[:limit] if stage == 'title_abstract' else self._smart_truncate(text, limit)
+        metadata.prepared_text_chars = len(prepared)
+        metadata.text_truncated = len(prepared) < len(text)
+        metadata.text_input_state = 'prepared'
+        with self._lock:
+            counts = self._text_input_counts[stage]
+            counts['prepared_count'] += 1
+            counts['truncated_count'] += int(metadata.text_truncated)
+        return prepared
+
     # ── LLM call with retry ──────────────────────────────────────────────────
 
     def _sync_llm_call_metadata(self) -> Dict[str, Any]:
@@ -1054,6 +1104,11 @@ class SystematicReviewAutomation:
         raw = None
         first_failed_raw = None
         parse_retry_count = 0
+        stage_key = 'title_abstract' if stage == 'Title/Abstract' else 'full_text'
+        text_input = TextInputMetadata(
+            input_text_chars=len(text), text_limit_chars=self._text_input_limits()[stage_key],
+            text_input_state='worker_error',
+        )
         cache_context = self._cache_key_context(
             kind='screening',
             text=text,
@@ -1063,9 +1118,11 @@ class SystematicReviewAutomation:
         cache_key = cache_context['cache_key']
         cached = self._cache_load(cache_key, 'screening', expected_context=cache_context)
         if cached:
+            self._prepare_text_input(text, stage_key, text_input, cache_hit=True)
             cached.update({'filename': filename, 'processing_time': time.time() - start, 'api_tokens_used': 0})
             # Only pass fields that exist in the dataclass
             valid = {k: cached[k] for k in ScreeningResult.__dataclass_fields__ if k in cached}
+            valid.update(asdict(text_input))
             result = ScreeningResult(**valid)
             self._write_audit_event(
                 kind='screening',
@@ -1073,6 +1130,7 @@ class SystematicReviewAutomation:
                 stage=stage,
                 cache_context=cache_context,
                 cache_hit=True,
+                text_input=text_input,
                 tokens=0,
                 decision=result.decision,
             )
@@ -1080,11 +1138,7 @@ class SystematicReviewAutomation:
 
         failure_stage = 'processing'
         try:
-            snippet = (
-                text[:self.two_stage_chars]  # title/abstract only for stage-1
-                if stage == "Title/Abstract"
-                else self._smart_truncate(text, self.max_text_chars)
-            )
+            snippet = self._prepare_text_input(text, stage_key, text_input)
             messages = [
                 {"role": "system", "content": "You are a systematic review assistant. Only return valid JSON."},
                 {"role": "user",   "content": _render_paper_prompt(self.screening_prompt, snippet)},
@@ -1132,11 +1186,14 @@ class SystematicReviewAutomation:
                 processing_time=time.time() - start,
                 text_length=len(text),
                 api_tokens_used=tokens,
+                **asdict(text_input),
             )
 
             cache_data = asdict(result)
             cache_data.pop('filename', None)
             cache_data.pop('processing_time', None)
+            for column in TEXT_INPUT_COLUMNS:
+                cache_data.pop(column)
             cache_data['cache_metadata'] = cache_context
             self._cache_save(cache_key, 'screening', cache_data)
 
@@ -1146,6 +1203,7 @@ class SystematicReviewAutomation:
                 stage=stage,
                 cache_context=cache_context,
                 cache_hit=False,
+                text_input=text_input,
                 tokens=tokens,
                 decision=result.decision,
                 parse_retry_count=parse_retry_count,
@@ -1165,6 +1223,7 @@ class SystematicReviewAutomation:
                 stage=stage,
                 cache_context=cache_context,
                 cache_hit=False,
+                text_input=text_input,
                 status='error',
                 parse_status='error',
                 **self._audit_llm_metadata(),
@@ -1185,6 +1244,7 @@ class SystematicReviewAutomation:
                 processing_time=time.time() - start,
                 text_length=len(text),
                 api_tokens_used=tokens,
+                **asdict(text_input),
             )
 
     # ── Extraction ───────────────────────────────────────────────────────────
@@ -1195,6 +1255,11 @@ class SystematicReviewAutomation:
         raw = None
         first_failed_raw = None
         parse_retry_count = 0
+        stage_key = 'extraction'
+        text_input = TextInputMetadata(
+            input_text_chars=len(text), text_limit_chars=self._text_input_limits()[stage_key],
+            text_input_state='worker_error',
+        )
         cache_context = self._cache_key_context(
             kind='extraction',
             text=text,
@@ -1203,24 +1268,27 @@ class SystematicReviewAutomation:
         cache_key = cache_context['cache_key']
         cached = self._cache_load(cache_key, 'extraction', expected_context=cache_context)
         if cached:
+            self._prepare_text_input(text, stage_key, text_input, cache_hit=True)
             result = ExtractionResult(
                 filename=filename,
                 fields=cached.get('fields', {}),
                 processing_time=time.time() - start,
                 api_tokens_used=0,
+                **asdict(text_input),
             )
             self._write_audit_event(
                 kind='extraction',
                 filename=filename,
                 cache_context=cache_context,
                 cache_hit=True,
+                text_input=text_input,
                 tokens=0,
             )
             return result
 
         failure_stage = 'processing'
         try:
-            chunk = self._smart_truncate(text, self.max_text_chars)
+            chunk = self._prepare_text_input(text, stage_key, text_input)
 
             # Build Quote-Then-Answer prompt — forces the model to ground each
             # extracted value in a verbatim sentence from the paper.
@@ -1311,6 +1379,7 @@ class SystematicReviewAutomation:
                 fields=data,
                 processing_time=time.time() - start,
                 api_tokens_used=tokens,
+                **asdict(text_input),
             )
 
             self._cache_save(cache_key, 'extraction', {
@@ -1323,6 +1392,7 @@ class SystematicReviewAutomation:
                 filename=filename,
                 cache_context=cache_context,
                 cache_hit=False,
+                text_input=text_input,
                 tokens=tokens,
                 parse_retry_count=parse_retry_count,
                 retry_first_raw_response=first_failed_raw,
@@ -1342,6 +1412,7 @@ class SystematicReviewAutomation:
                 filename=filename,
                 cache_context=cache_context,
                 cache_hit=False,
+                text_input=text_input,
                 status='error',
                 parse_status='error',
                 **self._audit_llm_metadata(),
@@ -1358,6 +1429,7 @@ class SystematicReviewAutomation:
                 fields={f: "Error" for f in self.extraction_fields},
                 processing_time=time.time() - start,
                 api_tokens_used=tokens,
+                **asdict(text_input),
             )
 
     # ── Single-PDF dispatcher ────────────────────────────────────────────────
@@ -1388,11 +1460,13 @@ class SystematicReviewAutomation:
                 decision="Error",
                 reasoning=text,
                 notes="PDF extraction failed",
+                text_input_state='conversion_failed',
             ), None
 
         if self.dry_run:
             return ScreeningResult(pdf_name, ScreeningDecision.FLAG_FOR_HUMAN.value,
-                                   "Dry run: text extracted; no AI calls made.", ""), None
+                                   "Dry run: text extracted; no AI calls made.", "",
+                                   text_input_state='dry_run'), None
 
         # Optional stage-1: title/abstract quick screen
         if self.two_stage_screening:
@@ -1426,6 +1500,7 @@ class SystematicReviewAutomation:
             self._last_text_extraction_metadata.clear()
             with self._lock:
                 self._batch_text_hashes.clear()
+                self._text_input_counts = self._new_text_input_counts()
                 for key in self.stats:
                     self.stats[key] = '' if key == 'current_file' else 0
             self._write_run_config()
@@ -1484,7 +1559,8 @@ class SystematicReviewAutomation:
                     except Exception as e:
                         f = fmap[future]
                         self.logger.error(f"Worker crashed on {self._pdf_display_name(f)}: {e}")
-                        record(ScreeningResult(self._pdf_display_name(f), "Error", "Worker failed", "Processing failed"), None)
+                        record(ScreeningResult(self._pdf_display_name(f), "Error", "Worker failed", "Processing failed",
+                                               text_input_state='worker_error'), None)
         else:
             for pdf_file in pdf_files:
                 if self.stop_event.is_set():
@@ -1496,7 +1572,8 @@ class SystematicReviewAutomation:
                     break
                 except Exception as e:
                     self.logger.error(f"Error on {self._pdf_display_name(pdf_file)}: {e}")
-                    record(ScreeningResult(self._pdf_display_name(pdf_file), "Error", "Worker failed", "Processing failed"), None)
+                    record(ScreeningResult(self._pdf_display_name(pdf_file), "Error", "Worker failed", "Processing failed",
+                                           text_input_state='worker_error'), None)
 
         with self._lock:
             self.stats['total_processing_time'] = time.time() - t0
@@ -1508,10 +1585,38 @@ class SystematicReviewAutomation:
 
     def _screening_headers(self) -> List[str]:
         return ["filename", "decision", "stage", "reasoning", "notes",
-                "processing_time", "text_length", "api_tokens_used"]
+                "processing_time", "text_length", "api_tokens_used", *TEXT_INPUT_COLUMNS]
 
-    def _extraction_headers(self) -> List[str]:
+    def _extraction_base_headers(self) -> List[str]:
         return ["filename"] + self.extraction_fields + ["processing_time", "api_tokens_used"]
+
+    @staticmethod
+    def _excel_column_title(name: str) -> str:
+        return name.replace('_', ' ').title()
+
+    def _extraction_metadata_columns(self) -> Dict[str, str]:
+        used = {self._excel_column_title(name) for name in self._extraction_base_headers()}
+        columns = {}
+        for name in TEXT_INPUT_COLUMNS:
+            column = name
+            if self._excel_column_title(column) in used:
+                prefix = f'slr_meta_{name}'
+                column = prefix
+                suffix = 2
+                while self._excel_column_title(column) in used:
+                    column = f'{prefix}_{suffix}'
+                    suffix += 1
+            used.add(self._excel_column_title(column))
+            columns[name] = column
+        return columns
+
+    def _extraction_row(self, result: ExtractionResult, metadata_columns: Dict[str, str]) -> Dict[str, Any]:
+        row = {'filename': result.filename,
+               'processing_time': round(result.processing_time, 2),
+               'api_tokens_used': result.api_tokens_used}
+        row.update(result.fields)
+        row.update({column: getattr(result, name) for name, column in metadata_columns.items()})
+        return row
 
     def _excel_header(self, ws, headers: List[str]):
         hfill  = PatternFill("solid", fgColor="1F3864")
@@ -1520,7 +1625,7 @@ class SystematicReviewAutomation:
         thin   = Side(style='thin', color='C0C0C0')
         bdr    = Border(left=thin, right=thin, top=thin, bottom=thin)
         for ci, col in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=ci, value=col.replace('_', ' ').title())
+            cell = ws.cell(row=1, column=ci, value=self._excel_column_title(col))
             cell.fill, cell.font, cell.alignment, cell.border = hfill, hfont, halign, bdr
         ws.row_dimensions[1].height = 28
 
@@ -1545,15 +1650,13 @@ class SystematicReviewAutomation:
 
     def write_extraction_csv(self):
         try:
+            metadata_columns = self._extraction_metadata_columns()
+            headers = self._extraction_base_headers() + list(metadata_columns.values())
             with atomic_open(self.extraction_csv, 'w', newline='', encoding='utf-8') as f:
-                w = csv.DictWriter(f, fieldnames=self._extraction_headers(), extrasaction='ignore')
+                w = csv.DictWriter(f, fieldnames=headers, extrasaction='ignore')
                 w.writeheader()
                 for r in self.extraction_results:
-                    row = {'filename': r.filename,
-                           'processing_time': round(r.processing_time, 2),
-                           'api_tokens_used': r.api_tokens_used}
-                    row.update(r.fields)
-                    w.writerow(csv_row(row))
+                    w.writerow(csv_row(self._extraction_row(r, metadata_columns)))
         except Exception as e:
             self.logger.error(f"Extraction CSV: {e}")
             raise
@@ -1604,16 +1707,16 @@ class SystematicReviewAutomation:
             wb      = Workbook()
             ws      = wb.active
             ws.title = "Extracted Data"
-            headers  = self._extraction_headers()
+            metadata_columns = self._extraction_metadata_columns()
+            metadata_headers = set(metadata_columns.values())
+            headers = self._extraction_base_headers() + list(metadata_columns.values())
             self._excel_header(ws, headers)
 
             for ri, r in enumerate(self.extraction_results, 2):
-                row = {'filename': r.filename,
-                       'processing_time': round(r.processing_time, 2),
-                       'api_tokens_used': r.api_tokens_used}
-                row.update(r.fields)
+                row = self._extraction_row(r, metadata_columns)
                 for ci, h in enumerate(headers, 1):
-                    cell = ws.cell(row=ri, column=ci, value=str(row.get(h, "")))
+                    value = row.get(h, "")
+                    cell = ws.cell(row=ri, column=ci, value=value if h in metadata_headers else str(value))
                     cell.alignment = Alignment(wrap_text=True, vertical='top')
                     if ri % 2 == 0:
                         cell.fill = alt
@@ -1667,6 +1770,7 @@ class SystematicReviewAutomation:
         with self._lock:
             s = self.stats.copy()
             paper_hashes = [entry for entry in self._batch_text_hashes.values() if entry is not None]
+            text_input_counts = {stage: counts.copy() for stage, counts in self._text_input_counts.items()}
         filenames_by_hash: Dict[str, List[str]] = {}
         for filename, text_hash in paper_hashes:
             filenames_by_hash.setdefault(text_hash, []).append(filename)
@@ -1707,6 +1811,11 @@ class SystematicReviewAutomation:
                 "extracted":  len(self.extraction_results),
             },
             "full_text_duplicates": duplicates,
+            "text_truncation": {
+                "limit_chars": self._text_input_limits(),
+                "stages": text_input_counts,
+                "extraction_metadata_columns": self._extraction_metadata_columns(),
+            },
         }
 
         t = s['total_processing_time']
@@ -1743,6 +1852,15 @@ class SystematicReviewAutomation:
                     f.write(f"  {group['text_hash'][:12]} ({group['count']} files)\n")
                     for filename in group['filenames']:
                         f.write(f"    {filename}\n")
+                f.write("\n")
+                f.write("TEXT TRUNCATION\n")
+                for stage, label in (('title_abstract', 'Title/Abstract'), ('full_text', 'Full-text'),
+                                     ('extraction', 'Extraction')):
+                    counts = text_input_counts[stage]
+                    limit = summary['text_truncation']['limit_chars'][stage]
+                    f.write(f"  {label}: prepared={counts['prepared_count']}, "
+                            f"truncated={counts['truncated_count']}, cache_hit={counts['cache_hit_count']}, "
+                            f"limit_chars={limit}\n")
                 f.write("\n")
                 f.write("OUTPUT FILES\n")
                 output_keys = ['screening_csv', 'screening_excel']

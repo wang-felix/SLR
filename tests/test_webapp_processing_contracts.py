@@ -715,6 +715,13 @@ def test_workspace_full_text_duplicates_preserve_contract_and_path_privacy(
             assert not PureWindowsPath(filename).anchor
         assert root.as_posix() not in json.dumps(duplicates)
         assert json.dumps(str(root))[1:-1] not in json.dumps(duplicates)
+        truncation = payload["summary"]["text_truncation"]
+        assert set(truncation["stages"]) == {"title_abstract", "full_text", "extraction"}
+        full_text = truncation["stages"]["full_text"]
+        assert full_text["prepared_count"] + full_text["cache_hit_count"] == 2
+        assert full_text["truncated_count"] == 0
+        assert root.as_posix() not in json.dumps(truncation)
+        assert json.dumps(str(root))[1:-1] not in json.dumps(truncation)
         _assert_no_sentinels(payload)
     assert sorted((row["filename"] for row in results["screening"]), key=str.lower) == names
     assert len(_automation_run_rows(root)) == 1
