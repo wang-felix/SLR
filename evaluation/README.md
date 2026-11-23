@@ -27,3 +27,7 @@ python evaluation/screening/evaluate.py label_sheet.xlsx sample_key.csv --result
 ## 记录结果
 
 按「抽样 → 盲标 → 评测 → 前后对比」进行。盲标指人工判断时先隐藏 AI 的答案。比较报告里的指标和逐篇分歧，记录模型和筛选规则中实际改变的部分。运行下一次评测前，保存需要保留的逐篇明细，因为脚本会写入同名文件。
+
+## 评测提示词与抽取字段
+
+归档文件及校验值见[提示词与抽取字段说明](prompts/README.md)。

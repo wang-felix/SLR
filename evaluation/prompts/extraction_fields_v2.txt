@@ -1,0 +1,5 @@
+coating_material
+preparation_method
+process_parameters_with_units_and_sample_groups
+source_verbatim_quote_copied_exactly_in_original_language_or_NOT_FOUND
+source_section_number_and_title
