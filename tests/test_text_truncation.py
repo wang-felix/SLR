@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import sys
 from unittest.mock import Mock
@@ -303,3 +304,180 @@ def test_existing_evaluation_readers_accept_new_report_columns(make_batch, tmp_p
         ):
             assert pick_col(table, None, hints, field) == field
             assert table[field].tolist() == [values.get(field, "paper.pdf")]
+
+
+@pytest.mark.parametrize("text, limit, expected", [
+    ("lead\n\nMethods A\n\nbody\n\nResults B\n\nan oversized paragraph at the end", 32,
+     "lead\n\nMethods A\n\nbody\n\nResults B"),
+    ("Methods first\n\nResults second\n\nDiscussion third", 18, "Methods first\n\nRes"),
+    ("an oversized paragraph\n\nok", 3, "ok"),
+    ("an oversized paragraph\n\nanother oversized paragraph", 3, "an "),
+    ("Methods\n\n\n\n \n\nResults\n\ntail", 16, "Methods\n\nResults"),
+    ("Methods A\n\nResults B", 11, "Methods A"),
+    ("front\n\nMethods", 1, "M"),
+    ("front\n\nMethods", 0, ""),
+    ("front\n\nMethods", -2, ""),
+    ("绪论\n\n研究结果\n\n附录段落很长", 8, "绪论\n\n研究结果"),
+    (" A\n\n\n\nB ", 9, " A\n\n\n\nB "),
+], ids=[
+    "interleaved-order", "partial-priority-budget", "skip-oversized-regular", "prefix-fallback",
+    "empty-paragraphs", "separator-boundary", "one-char", "zero-budget", "negative-budget",
+    "unicode-chars", "unchanged-short-text",
+])
+def test_smart_truncation_preserves_order_and_budget(make_batch, text, limit, expected):
+    auto, _ = make_batch({}, advanced_config={
+        "enable_smart_truncation": True,
+        "preserve_sections": ["method", "result", "discussion", "研究"],
+    })
+
+    actual = auto._smart_truncate(text, limit)
+
+    assert actual == expected
+    assert len(actual) <= max(limit, 0)
+
+
+@pytest.mark.parametrize("smart, text, prepared", [
+    (True, "A\r\n文  ", "A\r\n文  "),
+    (True, "12345678", "12345678"),
+    (False, "lead\n\nMethods A", "lead\n\nMe"),
+], ids=["short-smart", "exact-limit-smart", "long-smart-disabled"])
+def test_unaffected_requests_keep_prompt_bytes_and_cache_context(make_batch, monkeypatch, smart, text, prepared):
+    auto, client = make_batch(
+        {"paper.pdf": (text, True)}, advanced_config={"enable_smart_truncation": smart},
+    )
+    stage = "Full-text"
+    expected_contexts = [
+        auto._cache_key_context(kind="screening", text=text, stage=stage,
+                                prompt={"screening_prompt": auto.screening_prompt, "stage": stage}),
+        auto._cache_key_context(kind="extraction", text=text, prompt=auto._extraction_prompt_fingerprint_source()),
+    ]
+    cache_load = Mock(wraps=auto._cache_load)
+    monkeypatch.setattr(auto, "_cache_load", cache_load)
+
+    auto.process_pdfs()
+
+    assert [call.kwargs["expected_context"] for call in cache_load.call_args_list] == expected_contexts
+    assert all("truncation_fingerprint" not in context for context in expected_contexts)
+    screening, extraction = client.chat_completion_with_tokens.call_args_list
+    assert screening.args[0][0]["content"].encode("utf-8") == (
+        b"You are a systematic review assistant. Only return valid JSON."
+    )
+    assert extraction.args[0][0]["content"].encode("utf-8") == (
+        b"You extract structured data from research papers. Return only valid JSON."
+    )
+    assert screening.args[0][-1]["content"].encode("utf-8") == f"Screen {prepared}".encode("utf-8")
+    expected_extraction = (
+        f"Extract {prepared}\n\n"
+        "Apply the Quote-Then-Answer method for every field:\n"
+        "  1. Copy a verbatim sentence from the paper as the field_quote.\n"
+        "  2. Write the extracted value based ONLY on that quote.\n"
+        "  3. If no relevant text exists, set both field_quote and field to 'Not reported'.\n\n"
+        "Return ONLY valid JSON (no prose, no markdown fences):\n"
+        '{\n    "material_quote": "verbatim sentence(s) from the text",\n'
+        '    "material": "extracted value, or Not reported"\n}'
+    )
+    assert extraction.args[0][-1]["content"].encode("utf-8") == expected_extraction.encode("utf-8")
+
+
+def test_long_smart_cache_isolates_legacy_results_without_counting_cache_hits_as_prepared(make_batch, monkeypatch):
+    prepared = "lead\n\nMethods A\n\nbody\n\nResults B"
+    text = prepared + "\n\nan oversized paragraph at the end"
+    limit = len(prepared)
+    auto, client = make_batch(
+        {"paper.pdf": (text, True)}, two_stage_screening=True, cache_enabled=True,
+        advanced_config={"max_text_chars": limit, "enable_smart_truncation": True},
+    )
+    legacy_contexts = {}
+    for stage, decision in (("Title/Abstract", "Flag for Review"), ("Full-text", "Likely Exclude")):
+        legacy_context = auto._cache_key_context(
+            kind="screening", text=text, stage=stage, prompt={"screening_prompt": auto.screening_prompt, "stage": stage},
+        )
+        auto._cache_save(legacy_context["cache_key"], "screening", {
+            "decision": decision, "stage": stage, "reasoning": "legacy", "notes": "",
+            "text_length": len(text), "cache_metadata": legacy_context,
+        })
+        assert auto._cache_load(legacy_context["cache_key"], "screening", legacy_context)["decision"] == decision
+        legacy_contexts[stage] = legacy_context
+    legacy_extraction = auto._cache_key_context(
+        kind="extraction", text=text, prompt=auto._extraction_prompt_fingerprint_source(),
+    )
+    auto._cache_save(legacy_extraction["cache_key"], "extraction", {
+        "fields": {"material": "legacy"}, "cache_metadata": legacy_extraction,
+    })
+    assert auto._cache_load(legacy_extraction["cache_key"], "extraction", legacy_extraction)["fields"] == {
+        "material": "legacy",
+    }
+    truncate = Mock(wraps=auto._smart_truncate)
+    monkeypatch.setattr(auto, "_smart_truncate", truncate)
+
+    first = auto.process_pdfs()
+
+    assert truncate.call_count == 2
+    assert all(call.args == (text, limit) for call in truncate.call_args_list)
+    screening, extraction = client.chat_completion_with_tokens.call_args_list
+    assert screening.args[0][-1]["content"] == f"Screen {prepared}"
+    assert extraction.args[0][-1]["content"].startswith(f"Extract {prepared}\n\nApply")
+    assert auto.screening_results[0].decision == "Likely Include"
+    assert auto.extraction_results[0].fields["material"] == "ceramic"
+    assert first["text_truncation"]["stages"] == {
+        "title_abstract": _counts(cache_hit=1), "full_text": _counts(1, 1), "extraction": _counts(1, 1),
+    }
+    title, full, extracted = _audit(auto)[1:]
+    assert title["cache_key"] == legacy_contexts["Title/Abstract"]["cache_key"]
+    assert title["cache_hit"] is True
+    for event, legacy_context in ((full, legacy_contexts["Full-text"]), (extracted, legacy_extraction)):
+        assert event["cache_hit"] is False
+        assert event["cache_key"] != legacy_context["cache_key"]
+        assert event["text_hash"] == legacy_context["text_hash"]
+        assert event["prompt_hash"] == legacy_context["prompt_hash"]
+        assert event["text_cache"]["text_hash"] == hashlib.sha256(text.encode("utf-8")).hexdigest()
+        cache_file = auto.cache_folder / f"{event['kind']}_{event['cache_key']}.json"
+        new_context = json.loads(cache_file.read_text(encoding="utf-8"))["cache_metadata"]
+        assert new_context == {
+            **legacy_context,
+            "cache_key": event["cache_key"],
+            "truncation_fingerprint": {
+                "algorithm": "order_preserving_budget_v1",
+                "snippet_hash": hashlib.sha256(prepared.encode("utf-8")).hexdigest(),
+            },
+        }
+    client.reset_mock()
+    truncate.reset_mock()
+
+    second = auto.process_pdfs()
+
+    assert truncate.call_count == 2
+    client.chat_completion_with_tokens.assert_not_called()
+    client.chat_completion_structured.assert_not_called()
+    assert second["text_truncation"]["stages"] == {
+        stage: _counts(cache_hit=1) for stage in ("title_abstract", "full_text", "extraction")
+    }
+    for event, original in zip(_audit(auto)[-3:], (title, full, extracted)):
+        assert event["cache_key"] == original["cache_key"]
+        assert event["cache_hit"] is True
+        assert event["text_input"]["state"] == "cache_hit"
+        assert event["text_input"]["prepared_text_chars"] is None
+        assert event["text_input"]["text_truncated"] is None
+    expected_tail = [[len(text), None, None, limit, "cache_hit"]]
+    _assert_tail(auto.screening_csv, auto.screening_excel, METADATA_COLUMNS, expected_tail)
+    _assert_tail(auto.extraction_csv, auto.extraction_excel, METADATA_COLUMNS, expected_tail)
+
+
+def test_smart_precomputation_failure_still_uses_stage_error_audit(make_batch, monkeypatch):
+    auto, client = make_batch({}, advanced_config={"enable_smart_truncation": True})
+    truncate = Mock(side_effect=ValueError("could not prepare fixture"))
+    monkeypatch.setattr(auto, "_smart_truncate", truncate)
+    text = "long text fixture"
+
+    screening = auto.screen_article(text, "paper.pdf")
+    extraction = auto.extract_data(text, "paper.pdf")
+
+    assert screening.decision == "Error"
+    assert extraction.fields == {"material": "Error"}
+    assert screening.text_input_state == extraction.text_input_state == "worker_error"
+    assert truncate.call_count == 2
+    client.chat_completion_with_tokens.assert_not_called()
+    assert [event["kind"] for event in _audit(auto)] == ["screening", "extraction"]
+    for event in _audit(auto):
+        assert event["failure_stage"] == "processing"
+        assert event["text_input"]["state"] == "worker_error"

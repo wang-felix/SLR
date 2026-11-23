@@ -32,6 +32,7 @@ from enum import Enum
 from version import VERSION as __version__
 
 CACHE_SCHEMA_VERSION = "3"
+SMART_TRUNCATION_ALGORITHM = "order_preserving_budget_v1"
 PARSE_RETRY_LIMIT = 1
 _PDF_EXTRACTION_LOCK = threading.Lock()
 
@@ -522,6 +523,7 @@ class SystematicReviewAutomation:
         text: str,
         prompt: Any,
         stage: str = None,
+        precomputed_snippet: Optional[str] = None,
     ) -> Dict[str, Any]:
         context = {
             'cache_schema_version': CACHE_SCHEMA_VERSION,
@@ -536,6 +538,11 @@ class SystematicReviewAutomation:
             'extraction_fields_hash': _sha256_json(self.extraction_fields),
             'advanced_config_hash': _sha256_json(self._advanced_config_for_cache),
         }
+        if precomputed_snippet is not None:
+            context['truncation_fingerprint'] = {
+                'algorithm': SMART_TRUNCATION_ALGORITHM,
+                'snippet_hash': _hash_utf8(precomputed_snippet),
+            }
         context['cache_key'] = _sha256_json(context)
         return context
 
@@ -829,18 +836,49 @@ class SystematicReviewAutomation:
     def _smart_truncate(self, text: str, max_chars: int) -> str:
         if len(text) <= max_chars:
             return text
+        if max_chars <= 0:
+            return ""
         if not self.enable_smart_truncation:
             return text[:max_chars]
-        paragraphs = text.split('\n\n')
-        pri, rest = [], []
-        kw = self.preserve_sections
-        for p in paragraphs:
-            (pri if any(k in p.lower() for k in kw) else rest).append(p)
-        result = '\n\n'.join(pri)
-        for p in rest:
-            if len(result) + len(p) + 2 <= max_chars:
-                result += '\n\n' + p
-        return (result or text)[:max_chars]
+
+        priority, regular = [], []
+        for idx, paragraph in enumerate(text.split('\n\n')):
+            if not paragraph.strip():
+                continue
+            lowered = paragraph.lower()
+            if any(keyword in lowered for keyword in self.preserve_sections):
+                priority.append((idx, paragraph))
+            else:
+                regular.append((idx, paragraph))
+
+        selected: Dict[int, str] = {}
+        used_chars = 0
+        for idx, paragraph in priority:
+            sep = 2 if selected else 0
+            remaining = max_chars - used_chars - sep
+            if remaining <= 0:
+                break
+            selected[idx] = paragraph[:remaining]
+            used_chars += sep + len(selected[idx])
+            if remaining < len(paragraph):
+                break
+
+        if used_chars < max_chars:
+            for idx, paragraph in regular:
+                sep = 2 if selected else 0
+                cost = sep + len(paragraph)
+                if used_chars + cost <= max_chars:
+                    selected[idx] = paragraph
+                    used_chars += cost
+
+        if not selected:
+            return text[:max_chars]
+        return '\n\n'.join(selected[idx] for idx in sorted(selected))
+
+    def _precompute_smart_truncation(self, text: str, stage: str, limit: int) -> Optional[str]:
+        if stage in ('full_text', 'extraction') and self.enable_smart_truncation and len(text) > limit:
+            return self._smart_truncate(text, limit)
+        return None
 
     def _text_input_limits(self) -> Dict[str, int]:
         return {
@@ -857,6 +895,7 @@ class SystematicReviewAutomation:
 
     def _prepare_text_input(
         self, text: str, stage: str, metadata: TextInputMetadata, *, cache_hit: bool = False,
+        precomputed_snippet: Optional[str] = None,
     ) -> str:
         if cache_hit:
             metadata.text_input_state = 'cache_hit'
@@ -864,8 +903,10 @@ class SystematicReviewAutomation:
                 self._text_input_counts[stage]['cache_hit_count'] += 1
             return ""
 
-        limit = self._text_input_limits()[stage]
-        prepared = text[:limit] if stage == 'title_abstract' else self._smart_truncate(text, limit)
+        prepared = precomputed_snippet
+        if prepared is None:
+            limit = self._text_input_limits()[stage]
+            prepared = text[:limit] if stage == 'title_abstract' else self._smart_truncate(text, limit)
         metadata.prepared_text_chars = len(prepared)
         metadata.text_truncated = len(prepared) < len(text)
         metadata.text_input_state = 'prepared'
@@ -1105,40 +1146,42 @@ class SystematicReviewAutomation:
         first_failed_raw = None
         parse_retry_count = 0
         stage_key = 'title_abstract' if stage == 'Title/Abstract' else 'full_text'
+        limit = self._text_input_limits()[stage_key]
         text_input = TextInputMetadata(
-            input_text_chars=len(text), text_limit_chars=self._text_input_limits()[stage_key],
+            input_text_chars=len(text), text_limit_chars=limit,
             text_input_state='worker_error',
         )
-        cache_context = self._cache_key_context(
-            kind='screening',
-            text=text,
-            prompt={'screening_prompt': self.screening_prompt, 'stage': stage},
-            stage=stage,
-        )
-        cache_key = cache_context['cache_key']
-        cached = self._cache_load(cache_key, 'screening', expected_context=cache_context)
-        if cached:
-            self._prepare_text_input(text, stage_key, text_input, cache_hit=True)
-            cached.update({'filename': filename, 'processing_time': time.time() - start, 'api_tokens_used': 0})
-            # Only pass fields that exist in the dataclass
-            valid = {k: cached[k] for k in ScreeningResult.__dataclass_fields__ if k in cached}
-            valid.update(asdict(text_input))
-            result = ScreeningResult(**valid)
-            self._write_audit_event(
-                kind='screening',
-                filename=filename,
-                stage=stage,
-                cache_context=cache_context,
-                cache_hit=True,
-                text_input=text_input,
-                tokens=0,
-                decision=result.decision,
-            )
-            return result
-
+        prompt = {'screening_prompt': self.screening_prompt, 'stage': stage}
+        cache_context = None
         failure_stage = 'processing'
         try:
-            snippet = self._prepare_text_input(text, stage_key, text_input)
+            precomputed_snippet = self._precompute_smart_truncation(text, stage_key, limit)
+            cache_context = self._cache_key_context(
+                kind='screening', text=text, prompt=prompt, stage=stage,
+                precomputed_snippet=precomputed_snippet,
+            )
+            cache_key = cache_context['cache_key']
+            cached = self._cache_load(cache_key, 'screening', expected_context=cache_context)
+            if cached:
+                self._prepare_text_input(text, stage_key, text_input, cache_hit=True)
+                cached.update({'filename': filename, 'processing_time': time.time() - start, 'api_tokens_used': 0})
+                # Only pass fields that exist in the dataclass
+                valid = {k: cached[k] for k in ScreeningResult.__dataclass_fields__ if k in cached}
+                valid.update(asdict(text_input))
+                result = ScreeningResult(**valid)
+                self._write_audit_event(
+                    kind='screening',
+                    filename=filename,
+                    stage=stage,
+                    cache_context=cache_context,
+                    cache_hit=True,
+                    text_input=text_input,
+                    tokens=0,
+                    decision=result.decision,
+                )
+                return result
+
+            snippet = self._prepare_text_input(text, stage_key, text_input, precomputed_snippet=precomputed_snippet)
             messages = [
                 {"role": "system", "content": "You are a systematic review assistant. Only return valid JSON."},
                 {"role": "user",   "content": _render_paper_prompt(self.screening_prompt, snippet)},
@@ -1217,6 +1260,8 @@ class SystematicReviewAutomation:
         except Exception as e:
             safe_error = str(e) if isinstance(e, LLMCallError) else f"Screening failed ({type(e).__name__})"
             self.logger.error(f"Screening error {filename}: {safe_error}")
+            if cache_context is None:
+                cache_context = self._cache_key_context(kind='screening', text=text, prompt=prompt, stage=stage)
             self._write_audit_event(
                 kind='screening',
                 filename=filename,
@@ -1256,39 +1301,41 @@ class SystematicReviewAutomation:
         first_failed_raw = None
         parse_retry_count = 0
         stage_key = 'extraction'
+        limit = self._text_input_limits()[stage_key]
         text_input = TextInputMetadata(
-            input_text_chars=len(text), text_limit_chars=self._text_input_limits()[stage_key],
+            input_text_chars=len(text), text_limit_chars=limit,
             text_input_state='worker_error',
         )
-        cache_context = self._cache_key_context(
-            kind='extraction',
-            text=text,
-            prompt=self._extraction_prompt_fingerprint_source(),
-        )
-        cache_key = cache_context['cache_key']
-        cached = self._cache_load(cache_key, 'extraction', expected_context=cache_context)
-        if cached:
-            self._prepare_text_input(text, stage_key, text_input, cache_hit=True)
-            result = ExtractionResult(
-                filename=filename,
-                fields=cached.get('fields', {}),
-                processing_time=time.time() - start,
-                api_tokens_used=0,
-                **asdict(text_input),
-            )
-            self._write_audit_event(
-                kind='extraction',
-                filename=filename,
-                cache_context=cache_context,
-                cache_hit=True,
-                text_input=text_input,
-                tokens=0,
-            )
-            return result
-
+        prompt = self._extraction_prompt_fingerprint_source()
+        cache_context = None
         failure_stage = 'processing'
         try:
-            chunk = self._prepare_text_input(text, stage_key, text_input)
+            precomputed_snippet = self._precompute_smart_truncation(text, stage_key, limit)
+            cache_context = self._cache_key_context(
+                kind='extraction', text=text, prompt=prompt, precomputed_snippet=precomputed_snippet,
+            )
+            cache_key = cache_context['cache_key']
+            cached = self._cache_load(cache_key, 'extraction', expected_context=cache_context)
+            if cached:
+                self._prepare_text_input(text, stage_key, text_input, cache_hit=True)
+                result = ExtractionResult(
+                    filename=filename,
+                    fields=cached.get('fields', {}),
+                    processing_time=time.time() - start,
+                    api_tokens_used=0,
+                    **asdict(text_input),
+                )
+                self._write_audit_event(
+                    kind='extraction',
+                    filename=filename,
+                    cache_context=cache_context,
+                    cache_hit=True,
+                    text_input=text_input,
+                    tokens=0,
+                )
+                return result
+
+            chunk = self._prepare_text_input(text, stage_key, text_input, precomputed_snippet=precomputed_snippet)
 
             # Build Quote-Then-Answer prompt — forces the model to ground each
             # extracted value in a verbatim sentence from the paper.
@@ -1405,6 +1452,8 @@ class SystematicReviewAutomation:
         except Exception as e:
             safe_error = str(e) if isinstance(e, LLMCallError) else f"Extraction failed ({type(e).__name__})"
             self.logger.error(f"Extraction error {filename}: {safe_error}")
+            if cache_context is None:
+                cache_context = self._cache_key_context(kind='extraction', text=text, prompt=prompt)
             if failure_stage == 'structured':
                 raw = _structured_error_response(e)
             self._write_audit_event(
