@@ -128,6 +128,8 @@ class TextInputMetadata:
 
 
 TEXT_INPUT_COLUMNS = tuple(column.name for column in fields(TextInputMetadata))
+REVIEW_ROUTING_COLUMNS = ("confidence", "raw_decision", "review_trigger")
+CONFIDENCE_LEVELS = ("Low", "Medium", "High")
 
 
 @dataclass
@@ -140,6 +142,9 @@ class ScreeningResult(TextInputMetadata):
     processing_time: float = 0.0
     text_length:     int   = 0
     api_tokens_used: int   = 0
+    confidence: Optional[str] = None
+    raw_decision: Optional[str] = None
+    review_trigger: Optional[str] = None
 
 
 @dataclass
@@ -297,6 +302,12 @@ class SystematicReviewAutomation:
         self.skip_pages = int(adv.get('skip_pages', 0))
         self.output_format = adv.get('output_format', 'both')
         self.include_excluded = bool(adv.get('include_excluded', True))
+        self.flag_confidence_threshold = adv.get('flag_confidence_threshold')
+        self.flag_confidence_scope = adv.get('flag_confidence_scope', 'all')
+        if self.flag_confidence_threshold not in (None, 'low', 'medium'):
+            raise ValueError("flag_confidence_threshold must be None, 'low', or 'medium'")
+        if self.flag_confidence_scope not in ('all', 'exclude_only'):
+            raise ValueError("flag_confidence_scope must be 'all' or 'exclude_only'")
         if self.skip_pages < 0 or self.output_format not in {'csv', 'excel', 'both'}:
             raise ValueError('Invalid page skip or output format')
         self.include_subfolders         = bool(
@@ -570,6 +581,7 @@ class SystematicReviewAutomation:
         parse_retry_count: int = 0,
         retry_first_raw_response: Optional[str] = None,
         exception_type: Optional[str] = None,
+        review_routing: Optional[Dict[str, Any]] = None,
     ):
         provider_profile = cache_context.get('provider_profile') or {}
         text_cache_metadata = self.get_paper_text_metadata(filename)
@@ -605,6 +617,8 @@ class SystematicReviewAutomation:
         }
         if error_category:
             event['error_category'] = error_category
+        if review_routing:
+            event.update(review_routing)
         if text_cache_metadata:
             event['text_cache'] = text_cache_metadata
         if error:
@@ -635,7 +649,7 @@ class SystematicReviewAutomation:
                     'temperature': 'not_sent' if adapter == 'native_anthropic' else self.temperature,
                     'max_tokens': self.max_output_tokens,
                 }
-            self._append_audit_event({
+            event = {
                 'kind': 'run_config',
                 'timestamp': datetime.now().isoformat(timespec='seconds'),
                 'app_version': __version__,
@@ -648,7 +662,10 @@ class SystematicReviewAutomation:
                 'extraction_fields': self.extraction_fields,
                 'screening': {'temperature': self.temperature, 'max_tokens': min(1500, self.max_output_tokens)},
                 'extraction': extraction,
-            })
+            }
+            if self.flag_confidence_threshold is not None:
+                event['review_routing'] = self._confidence_routing_config()
+            self._append_audit_event(event)
         except Exception:
             self.logger.warning("Run configuration audit write failed")
 
@@ -1139,6 +1156,33 @@ class SystematicReviewAutomation:
 
     # ── Screening ────────────────────────────────────────────────────────────
 
+    def _confidence_routing_config(self) -> Dict[str, Any]:
+        return {
+            'flag_confidence_threshold': self.flag_confidence_threshold,
+            'flag_confidence_scope': self.flag_confidence_scope,
+        }
+
+    def _route_screening_result(self, result: ScreeningResult) -> Dict[str, Any]:
+        threshold = self.flag_confidence_threshold
+        if threshold is None or result.stage != 'Full-text':
+            return {'confidence': result.confidence} if result.confidence else {}
+
+        result.raw_decision = result.decision
+        eligible = result.decision == ScreeningDecision.LIKELY_EXCLUDE.value or (
+            self.flag_confidence_scope == 'all' and result.decision == ScreeningDecision.LIKELY_INCLUDE.value
+        )
+        if eligible and (
+            result.confidence == 'Low' or (threshold == 'medium' and result.confidence == 'Medium')
+        ):
+            result.decision = ScreeningDecision.FLAG_FOR_HUMAN.value
+            result.review_trigger = 'confidence_threshold'
+        return {column: getattr(result, column) for column in REVIEW_ROUTING_COLUMNS}
+
+    @staticmethod
+    def _normalize_screening_confidence(value: Any) -> Optional[str]:
+        confidence = value.strip().capitalize() if isinstance(value, str) else None
+        return confidence if confidence in CONFIDENCE_LEVELS else None
+
     def screen_article(self, text: str, filename: str, stage: str = "Full-text") -> ScreeningResult:
         start = time.time()
         tokens = 0
@@ -1168,7 +1212,11 @@ class SystematicReviewAutomation:
                 # Only pass fields that exist in the dataclass
                 valid = {k: cached[k] for k in ScreeningResult.__dataclass_fields__ if k in cached}
                 valid.update(asdict(text_input))
+                valid['confidence'] = self._normalize_screening_confidence(cached.get('confidence'))
+                valid.pop('raw_decision', None)
+                valid.pop('review_trigger', None)
                 result = ScreeningResult(**valid)
+                review_routing = self._route_screening_result(result)
                 self._write_audit_event(
                     kind='screening',
                     filename=filename,
@@ -1178,6 +1226,7 @@ class SystematicReviewAutomation:
                     text_input=text_input,
                     tokens=0,
                     decision=result.decision,
+                    review_routing=review_routing,
                 )
                 return result
 
@@ -1229,17 +1278,24 @@ class SystematicReviewAutomation:
                 processing_time=time.time() - start,
                 text_length=len(text),
                 api_tokens_used=tokens,
+                confidence=self._normalize_screening_confidence(data.get('confidence')),
                 **asdict(text_input),
             )
 
+            # Routing is run policy. Cache the model's decision before applying it.
             cache_data = asdict(result)
             cache_data.pop('filename', None)
             cache_data.pop('processing_time', None)
             for column in TEXT_INPUT_COLUMNS:
                 cache_data.pop(column)
+            cache_data.pop('raw_decision')
+            cache_data.pop('review_trigger')
+            if result.confidence is None:
+                cache_data.pop('confidence')
             cache_data['cache_metadata'] = cache_context
             self._cache_save(cache_key, 'screening', cache_data)
 
+            review_routing = self._route_screening_result(result)
             self._write_audit_event(
                 kind='screening',
                 filename=filename,
@@ -1249,6 +1305,7 @@ class SystematicReviewAutomation:
                 text_input=text_input,
                 tokens=tokens,
                 decision=result.decision,
+                review_routing=review_routing,
                 parse_retry_count=parse_retry_count,
                 retry_first_raw_response=first_failed_raw,
                 **llm_metadata,
@@ -1633,8 +1690,9 @@ class SystematicReviewAutomation:
     # ── Output writers ───────────────────────────────────────────────────────
 
     def _screening_headers(self) -> List[str]:
+        routing_columns = REVIEW_ROUTING_COLUMNS if self.flag_confidence_threshold is not None else ()
         return ["filename", "decision", "stage", "reasoning", "notes",
-                "processing_time", "text_length", "api_tokens_used", *TEXT_INPUT_COLUMNS]
+                "processing_time", "text_length", "api_tokens_used", *routing_columns, *TEXT_INPUT_COLUMNS]
 
     def _extraction_base_headers(self) -> List[str]:
         return ["filename"] + self.extraction_fields + ["processing_time", "api_tokens_used"]
@@ -1866,6 +1924,13 @@ class SystematicReviewAutomation:
                 "extraction_metadata_columns": self._extraction_metadata_columns(),
             },
         }
+        if self.flag_confidence_threshold is not None:
+            summary['review_routing'] = {
+                **self._confidence_routing_config(),
+                'confidence_threshold_count': sum(
+                    result.review_trigger == 'confidence_threshold' for result in self.screening_results
+                ),
+            }
 
         t = s['total_processing_time']
         n = max(s['processed_files'], 1)
@@ -1888,6 +1953,13 @@ class SystematicReviewAutomation:
                 f.write(f"  Flagged for Review    : {p['flagged']}\n")
                 f.write(f"  Errors                : {p['errors']}\n")
                 f.write(f"  Data Extracted        : {p['extracted']}\n\n")
+                if 'review_routing' in summary:
+                    routing = summary['review_routing']
+                    f.write("HUMAN REVIEW ROUTING\n")
+                    f.write(f"  Confidence threshold  : {routing['flag_confidence_threshold']}\n")
+                    f.write(f"  Scope                 : {routing['flag_confidence_scope']}\n")
+                    f.write(f"  Routed by confidence  : {routing['confidence_threshold_count']}\n\n")
+
                 f.write("PERFORMANCE\n")
                 f.write(f"  Total time            : {t:.1f}s\n")
                 f.write(f"  Avg per file          : {summary['statistics'].get('avg_time_per_file', 0):.1f}s\n")

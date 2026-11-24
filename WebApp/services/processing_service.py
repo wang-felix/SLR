@@ -409,7 +409,7 @@ def persist_workspace_processing_suggestions(
             stage=stage,
             decision=result.get("decision", ""),
             rationale=result.get("reasoning") or result.get("rationale") or result.get("error") or "",
-            confidence=None,
+            confidence=result.get("confidence"),
             provider=provider_profile.get("provider") or audit.get("provider") or "",
             model=audit.get("model") or "",
             prompt_hash=audit.get("prompt_hash") or "",
