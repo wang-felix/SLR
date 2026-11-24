@@ -130,6 +130,8 @@ class TextInputMetadata:
 TEXT_INPUT_COLUMNS = tuple(column.name for column in fields(TextInputMetadata))
 REVIEW_ROUTING_COLUMNS = ("confidence", "raw_decision", "review_trigger")
 CONFIDENCE_LEVELS = ("Low", "Medium", "High")
+MODEL_FLAG_DECISIONS = {ScreeningDecision.FLAG_FOR_REVIEW.value, ScreeningDecision.FLAG_FOR_HUMAN.value}
+CONSENSUS_SEPARATOR = " | "
 
 
 @dataclass
@@ -148,6 +150,11 @@ class ScreeningResult(TextInputMetadata):
 
 
 @dataclass
+class _ConsensusScreeningResult(ScreeningResult):
+    consensus_decisions: str = ""
+
+
+@dataclass
 class ExtractionResult(TextInputMetadata):
     """
     Dynamic extraction result — fields dict holds user-defined columns.
@@ -157,6 +164,33 @@ class ExtractionResult(TextInputMetadata):
     fields:          Dict[str, Any] = field(default_factory=dict)
     processing_time: float = 0.0
     api_tokens_used: int   = 0
+
+
+def _aggregate_screening_passes(results: List[ScreeningResult]) -> ScreeningResult:
+    decisions = [result.decision for result in results]
+    valid = [result for result in results if result.decision != ScreeningDecision.ERROR.value]
+    representative = valid[0] if valid else results[0]
+    trigger = None
+    if valid and len(valid) < len(results):
+        trigger = 'partial_error'
+    elif MODEL_FLAG_DECISIONS.intersection(decisions):
+        trigger = 'model_flag'
+    elif len(set(decisions)) > 1:
+        trigger = 'pass_disagreement'
+
+    reported_confidences = {result.confidence for result in valid}
+    confidence = next((level for level in CONFIDENCE_LEVELS if level in reported_confidences), None)
+    values = asdict(representative)
+    values.update(
+        decision=ScreeningDecision.FLAG_FOR_HUMAN.value if trigger else representative.decision,
+        raw_decision=results[0].decision,
+        confidence=confidence,
+        review_trigger=trigger,
+        consensus_decisions=CONSENSUS_SEPARATOR.join(decisions),
+        processing_time=sum(result.processing_time for result in results),
+        api_tokens_used=sum(result.api_tokens_used for result in results),
+    )
+    return _ConsensusScreeningResult(**values)
 
 
 @dataclass
@@ -304,6 +338,12 @@ class SystematicReviewAutomation:
         self.include_excluded = bool(adv.get('include_excluded', True))
         self.flag_confidence_threshold = adv.get('flag_confidence_threshold')
         self.flag_confidence_scope = adv.get('flag_confidence_scope', 'all')
+        self.screening_consensus_passes = adv.get('screening_consensus_passes', 1)
+        self.consensus_scope = adv.get('consensus_scope', 'all')
+        if type(self.screening_consensus_passes) is not int or not 1 <= self.screening_consensus_passes <= 5:
+            raise ValueError("screening_consensus_passes must be an integer from 1 to 5")
+        if self.consensus_scope not in ('all', 'exclude_only'):
+            raise ValueError("consensus_scope must be 'all' or 'exclude_only'")
         if self.flag_confidence_threshold not in (None, 'low', 'medium'):
             raise ValueError("flag_confidence_threshold must be None, 'low', or 'medium'")
         if self.flag_confidence_scope not in ('all', 'exclude_only'):
@@ -412,6 +452,7 @@ class SystematicReviewAutomation:
         self._run_lock = threading.Lock()
         self._audit_lock = threading.Lock()
         self._text_input_counts = self._new_text_input_counts()
+        self._extra_screening_passes = 0
         self.stats = {
             'total_files':         0,
             'processed_files':     0,
@@ -535,6 +576,7 @@ class SystematicReviewAutomation:
         prompt: Any,
         stage: str = None,
         precomputed_snippet: Optional[str] = None,
+        consensus_pass: int = 1,
     ) -> Dict[str, Any]:
         context = {
             'cache_schema_version': CACHE_SCHEMA_VERSION,
@@ -554,6 +596,8 @@ class SystematicReviewAutomation:
                 'algorithm': SMART_TRUNCATION_ALGORITHM,
                 'snippet_hash': _hash_utf8(precomputed_snippet),
             }
+        if consensus_pass > 1:
+            context['consensus_pass'] = consensus_pass
         context['cache_key'] = _sha256_json(context)
         return context
 
@@ -582,6 +626,7 @@ class SystematicReviewAutomation:
         retry_first_raw_response: Optional[str] = None,
         exception_type: Optional[str] = None,
         review_routing: Optional[Dict[str, Any]] = None,
+        consensus_pass: Optional[int] = None,
     ):
         provider_profile = cache_context.get('provider_profile') or {}
         text_cache_metadata = self.get_paper_text_metadata(filename)
@@ -619,6 +664,8 @@ class SystematicReviewAutomation:
             event['error_category'] = error_category
         if review_routing:
             event.update(review_routing)
+        if consensus_pass is not None:
+            event['consensus_pass'] = consensus_pass
         if text_cache_metadata:
             event['text_cache'] = text_cache_metadata
         if error:
@@ -663,8 +710,8 @@ class SystematicReviewAutomation:
                 'screening': {'temperature': self.temperature, 'max_tokens': min(1500, self.max_output_tokens)},
                 'extraction': extraction,
             }
-            if self.flag_confidence_threshold is not None:
-                event['review_routing'] = self._confidence_routing_config()
+            if self._review_routing_enabled():
+                event['review_routing'] = self._review_routing_config()
             self._append_audit_event(event)
         except Exception:
             self.logger.warning("Run configuration audit write failed")
@@ -1156,11 +1203,17 @@ class SystematicReviewAutomation:
 
     # ── Screening ────────────────────────────────────────────────────────────
 
-    def _confidence_routing_config(self) -> Dict[str, Any]:
-        return {
+    def _review_routing_enabled(self) -> bool:
+        return self.flag_confidence_threshold is not None or self.screening_consensus_passes > 1
+
+    def _review_routing_config(self) -> Dict[str, Any]:
+        config = {
             'flag_confidence_threshold': self.flag_confidence_threshold,
             'flag_confidence_scope': self.flag_confidence_scope,
         }
+        if self.screening_consensus_passes > 1:
+            config.update(consensus_passes=self.screening_consensus_passes, consensus_scope=self.consensus_scope)
+        return config
 
     def _route_screening_result(self, result: ScreeningResult) -> Dict[str, Any]:
         threshold = self.flag_confidence_threshold
@@ -1183,7 +1236,29 @@ class SystematicReviewAutomation:
         confidence = value.strip().capitalize() if isinstance(value, str) else None
         return confidence if confidence in CONFIDENCE_LEVELS else None
 
+    def _screening_pass_audit(self, result: ScreeningResult, consensus_pass: Optional[int]) -> Dict[str, Any]:
+        if consensus_pass is None:
+            return self._route_screening_result(result)
+        return {'confidence': result.confidence}
+
     def screen_article(self, text: str, filename: str, stage: str = "Full-text") -> ScreeningResult:
+        if stage != 'Full-text' or self.screening_consensus_passes == 1:
+            return self._screen_article_once(text, filename, stage)
+
+        results = [self._screen_article_once(text, filename, stage, consensus_pass=1)]
+        if self.consensus_scope == 'all' or results[0].decision == ScreeningDecision.LIKELY_EXCLUDE.value:
+            for pass_index in range(2, self.screening_consensus_passes + 1):
+                results.append(self._screen_article_once(text, filename, stage, consensus_pass=pass_index))
+                with self._lock:
+                    self._extra_screening_passes += 1
+        result = _aggregate_screening_passes(results)
+        if result.review_trigger is None and result.decision != ScreeningDecision.ERROR.value:
+            self._route_screening_result(result)
+        return result
+
+    def _screen_article_once(
+        self, text: str, filename: str, stage: str, *, consensus_pass: Optional[int] = None,
+    ) -> ScreeningResult:
         start = time.time()
         tokens = 0
         raw = None
@@ -1199,10 +1274,13 @@ class SystematicReviewAutomation:
         cache_context = None
         failure_stage = 'processing'
         try:
+            if self.stop_event.is_set() and consensus_pass is not None:
+                raise InterruptedError("Screening stopped before the next consensus pass")
             precomputed_snippet = self._precompute_smart_truncation(text, stage_key, limit)
             cache_context = self._cache_key_context(
                 kind='screening', text=text, prompt=prompt, stage=stage,
                 precomputed_snippet=precomputed_snippet,
+                consensus_pass=consensus_pass or 1,
             )
             cache_key = cache_context['cache_key']
             cached = self._cache_load(cache_key, 'screening', expected_context=cache_context)
@@ -1216,7 +1294,7 @@ class SystematicReviewAutomation:
                 valid.pop('raw_decision', None)
                 valid.pop('review_trigger', None)
                 result = ScreeningResult(**valid)
-                review_routing = self._route_screening_result(result)
+                review_routing = self._screening_pass_audit(result, consensus_pass)
                 self._write_audit_event(
                     kind='screening',
                     filename=filename,
@@ -1227,6 +1305,7 @@ class SystematicReviewAutomation:
                     tokens=0,
                     decision=result.decision,
                     review_routing=review_routing,
+                    consensus_pass=consensus_pass,
                 )
                 return result
 
@@ -1295,7 +1374,7 @@ class SystematicReviewAutomation:
             cache_data['cache_metadata'] = cache_context
             self._cache_save(cache_key, 'screening', cache_data)
 
-            review_routing = self._route_screening_result(result)
+            review_routing = self._screening_pass_audit(result, consensus_pass)
             self._write_audit_event(
                 kind='screening',
                 filename=filename,
@@ -1306,6 +1385,7 @@ class SystematicReviewAutomation:
                 tokens=tokens,
                 decision=result.decision,
                 review_routing=review_routing,
+                consensus_pass=consensus_pass,
                 parse_retry_count=parse_retry_count,
                 retry_first_raw_response=first_failed_raw,
                 **llm_metadata,
@@ -1318,7 +1398,9 @@ class SystematicReviewAutomation:
             safe_error = str(e) if isinstance(e, LLMCallError) else f"Screening failed ({type(e).__name__})"
             self.logger.error(f"Screening error {filename}: {safe_error}")
             if cache_context is None:
-                cache_context = self._cache_key_context(kind='screening', text=text, prompt=prompt, stage=stage)
+                cache_context = self._cache_key_context(
+                    kind='screening', text=text, prompt=prompt, stage=stage, consensus_pass=consensus_pass or 1,
+                )
             self._write_audit_event(
                 kind='screening',
                 filename=filename,
@@ -1336,6 +1418,7 @@ class SystematicReviewAutomation:
                 raw_response=raw,
                 retry_first_raw_response=first_failed_raw,
                 exception_type=type(e).__name__,
+                consensus_pass=consensus_pass,
             )
             return ScreeningResult(
                 filename=filename,
@@ -1607,6 +1690,7 @@ class SystematicReviewAutomation:
             with self._lock:
                 self._batch_text_hashes.clear()
                 self._text_input_counts = self._new_text_input_counts()
+                self._extra_screening_passes = 0
                 for key in self.stats:
                     self.stats[key] = '' if key == 'current_file' else 0
             self._write_run_config()
@@ -1690,7 +1774,9 @@ class SystematicReviewAutomation:
     # ── Output writers ───────────────────────────────────────────────────────
 
     def _screening_headers(self) -> List[str]:
-        routing_columns = REVIEW_ROUTING_COLUMNS if self.flag_confidence_threshold is not None else ()
+        routing_columns = REVIEW_ROUTING_COLUMNS if self._review_routing_enabled() else ()
+        if self.screening_consensus_passes > 1:
+            routing_columns += ('consensus_decisions',)
         return ["filename", "decision", "stage", "reasoning", "notes",
                 "processing_time", "text_length", "api_tokens_used", *routing_columns, *TEXT_INPUT_COLUMNS]
 
@@ -1873,6 +1959,31 @@ class SystematicReviewAutomation:
 
     # ── Summary ──────────────────────────────────────────────────────────────
 
+    def _review_routing_summary(self, flagged_count: int) -> Dict[str, Any]:
+        triggers = dict.fromkeys(('model_flag', 'confidence_threshold', 'pass_disagreement', 'partial_error'), 0)
+        confidence_counts = dict.fromkeys(('High', 'Medium', 'Low', 'unspecified'), 0)
+        for result in self.screening_results:
+            confidence_counts[result.confidence or 'unspecified'] += 1
+            trigger = result.review_trigger
+            if trigger is None and result.decision in MODEL_FLAG_DECISIONS and result.text_input_state != 'dry_run':
+                trigger = 'model_flag'
+            if trigger in triggers:
+                triggers[trigger] += 1
+
+        screened_count = len(self.screening_results)
+        summary = {
+            **self._review_routing_config(),
+            'screened_count': screened_count,
+            'flagged_count': flagged_count,
+            'flag_rate': round(flagged_count / screened_count, 4) if screened_count else 0.0,
+            'triggers': triggers,
+            'confidence_counts': confidence_counts,
+            'confidence_threshold_count': triggers['confidence_threshold'],
+        }
+        if self.screening_consensus_passes > 1:
+            summary['extra_passes_run'] = self._extra_screening_passes
+        return summary
+
     def _generate_summary(self) -> Dict:
         with self._lock:
             s = self.stats.copy()
@@ -1924,13 +2035,8 @@ class SystematicReviewAutomation:
                 "extraction_metadata_columns": self._extraction_metadata_columns(),
             },
         }
-        if self.flag_confidence_threshold is not None:
-            summary['review_routing'] = {
-                **self._confidence_routing_config(),
-                'confidence_threshold_count': sum(
-                    result.review_trigger == 'confidence_threshold' for result in self.screening_results
-                ),
-            }
+        if self._review_routing_enabled():
+            summary['review_routing'] = self._review_routing_summary(summary['prisma']['flagged'])
 
         t = s['total_processing_time']
         n = max(s['processed_files'], 1)
@@ -1957,8 +2063,18 @@ class SystematicReviewAutomation:
                     routing = summary['review_routing']
                     f.write("HUMAN REVIEW ROUTING\n")
                     f.write(f"  Confidence threshold  : {routing['flag_confidence_threshold']}\n")
-                    f.write(f"  Scope                 : {routing['flag_confidence_scope']}\n")
-                    f.write(f"  Routed by confidence  : {routing['confidence_threshold_count']}\n\n")
+                    f.write(f"  Confidence scope      : {routing['flag_confidence_scope']}\n")
+                    if 'consensus_passes' in routing:
+                        f.write(f"  Consensus passes      : {routing['consensus_passes']}\n")
+                        f.write(f"  Consensus scope       : {routing['consensus_scope']}\n")
+                        f.write(f"  Extra passes run      : {routing['extra_passes_run']}\n")
+                    f.write(f"  Screened              : {routing['screened_count']}\n")
+                    f.write(f"  Flagged               : {routing['flagged_count']}\n")
+                    f.write(f"  Flag rate             : {routing['flag_rate']:.4f}\n")
+                    for label, key in (('Triggers', 'triggers'), ('Confidence counts', 'confidence_counts')):
+                        counts = ', '.join(f"{name}={count}" for name, count in routing[key].items())
+                        f.write(f"  {label}: {counts}\n")
+                    f.write("\n")
 
                 f.write("PERFORMANCE\n")
                 f.write(f"  Total time            : {t:.1f}s\n")
