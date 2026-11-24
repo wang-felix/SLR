@@ -10,8 +10,8 @@ no_excerpt, too_short, pdf_missing, not_found, location_only.
 """
 import argparse
 import pandas as pd
-from extraction_utils import (read_table, pick_col, norm_col, load_pdf_text, index_pdfs,
-                              parse_excerpt_field, check_excerpt, wilson)
+from extraction_utils import (read_table, pick_col, norm_col, load_pdf_text_and_pages, index_pdfs,
+                              parse_excerpt_field, check_excerpt_with_pages, wilson)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -34,22 +34,26 @@ def main():
         name = str(r[fcol]); key = name.lower()
         quote, location, status = parse_excerpt_field(r[ecol])
         if status:
-            rows.append((name, status, 0, 0, "", location))
+            rows.append((name, status, 0, 0, "", location, ""))
             continue
         path = idx.get(key) or idx.get(key.rsplit(".", 1)[0])
         if path is None:
-            rows.append((name, "pdf_missing", 0, 0, "", location))
+            rows.append((name, "pdf_missing", 0, 0, "", location, ""))
             continue
         if path not in cache:
-            cache[path] = load_pdf_text(path)
-        rows.append((name,) + check_excerpt(cache[path], quote) + (location,))
+            cache[path] = load_pdf_text_and_pages(path)
+        text, pages = cache[path]
+        *result, matched = check_excerpt_with_pages(text, quote, pages)
+        rows.append((name, *result, location, matched))
     out = pd.DataFrame(rows, columns=["filename", "status", "n_segments", "n_verified",
-                                      "first_unverified_segment", "location"])
+                                      "first_unverified_segment", "location", "matched_pages"])
     out.to_csv(a.out, index=False, encoding="utf-8-sig")
     vc = out.status.value_counts().to_dict()
     checkable = out[out.status.isin(["pass", "partial", "fail"])]
     n = len(checkable); k_fail = int((checkable.status == "fail").sum()); k_bad = int((checkable.status != "pass").sum())
     print("status counts:", vc)
+    verified = out[out.status.isin(["pass", "pass_fragmented"])]
+    print(f"verified excerpts with matched pages: {verified.matched_pages.ne('').sum()}/{len(verified)}")
     if vc.get("pass_fragmented"):
         print(f"fragmented matches (reported separately): {vc['pass_fragmented']}")
     if n:

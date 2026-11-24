@@ -203,13 +203,37 @@ def parse_excerpt_field(value):
         return "", text, "location_only"
     return text, "", None
 
-def _prepare_search_text(s):
-    s = unicodedata.normalize("NFKC", str(s)).replace("\r\n", "\n").replace("\r", "\n")
-    s = _INLINE_TAG.sub("", s)
+def _normalize_unicode(s):
+    return unicodedata.normalize("NFKC", str(s)).replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _remove_search_text(pattern, text, boundaries):
+    if boundaries is None:
+        return pattern.sub("", text)
+    # A page boundary inside deleted markup or a split word moves to the join.
+    index, removed = 0, 0
+    for match in pattern.finditer(text):
+        while index < len(boundaries) and boundaries[index] <= match.end():
+            boundaries[index] = min(boundaries[index], match.start()) - removed
+            index += 1
+        removed += match.end() - match.start()
+    for i in range(index, len(boundaries)):
+        boundaries[i] -= removed
+    return pattern.sub("", text)
+
+
+def _clean_search_text(s, boundaries=None):
+    s = _remove_search_text(_INLINE_TAG, s, boundaries)
     s = re.sub(r"[\u2010-\u2015\u2212]", "-", s)
-    s = _HYPHENATED_BREAK.sub("", s)
-    s = _PAGE_NUMBER_LINE.sub("", s)
+    s = _remove_search_text(_HYPHENATED_BREAK, s, boundaries)
+    s = _remove_search_text(_PAGE_NUMBER_LINE, s, boundaries)
+    if boundaries is not None:
+        boundaries[:] = [len(s[:offset].lower()) for offset in boundaries]
     return re.sub(r"[*_`#>|\\\[\]]", " ", s.lower())  # Markdown from the PDF converter
+
+
+def _prepare_search_text(s):
+    return _clean_search_text(_normalize_unicode(s))
 
 
 def norm_search(s):
@@ -220,11 +244,11 @@ def split_excerpt(excerpt, min_len=12):
     segs = [norm_search(p) for p in parts]
     return [p for p in segs if len(p) >= min_len]
 
-def _matches_fragmented(text, text_norm, excerpt):
+def _fragment_spans(text, text_norm, excerpt):
     words = _prepare_search_text(excerpt).split()
     min_words = min(_FRAGMENT_WORD_COUNTS)
     if len(words) < 2 * min_words or sum(map(len, words)) > _FRAGMENT_SPAN_LIMIT:
-        return False
+        return None
 
     # Map whitespace-insensitive search hits back to character positions with whitespace.
     positions = [i for i, char in enumerate(text) if not char.isspace()]
@@ -256,7 +280,7 @@ def _matches_fragmented(text, text_norm, excerpt):
             @cache
             def follows(word_offset, previous_end):
                 if word_offset == len(words):
-                    return True
+                    return ()
                 for next_offset, fragment in chunks(word_offset):
                     short_edge = word_offset < min_words or next_offset - word_offset < min_words
                     for start, finish in occurrences(fragment, previous_end, stop):
@@ -264,40 +288,54 @@ def _matches_fragmented(text, text_norm, excerpt):
                             gap = text[positions[previous_end - 1] + 1:positions[start]]
                             if not _CAPTION.search(gap):
                                 continue
-                        if follows(next_offset, finish):
-                            return True
-                return False
+                        tail = follows(next_offset, finish)
+                        if tail is not None:
+                            return ((start, finish), *tail)
+                return None
 
-            if follows(offset, end):
-                return True
-    return False
+            tail = follows(offset, end)
+            if tail is not None:
+                return ((begin, end), *tail)
+    return None
 
 
 def check_excerpt(pdf_text, excerpt, near=0.8):
     """Return (status, n_segments, n_verified, first_unverified_segment).
     status: pass | pass_fragmented | partial | fail | language_mismatch | no_excerpt | too_short"""
+    return _check_prepared_excerpt(_prepare_search_text(pdf_text), excerpt, near)
+
+
+def _check_prepared_excerpt(text, excerpt, near, spans=None):
     if is_missing(excerpt):
         return "no_excerpt", 0, 0, ""
     segs = split_excerpt(excerpt)
     if not segs:
         return "too_short", 0, 0, ""
-    text = _prepare_search_text(pdf_text)
     text_norm = re.sub(r"\s+", "", text)
-    exact = [seg in text_norm for seg in segs]
-    if all(exact):
+    exact = [text_norm.find(seg) for seg in segs]
+    if all(hit >= 0 for hit in exact):
+        if spans is not None:
+            spans.extend((hit, hit + len(seg)) for hit, seg in zip(exact, segs))
         return "pass", len(segs), len(segs), ""
-    if _matches_fragmented(text, text_norm, excerpt):
+    fragments = _fragment_spans(text, text_norm, excerpt)
+    if fragments is not None:
+        if spans is not None:
+            spans.extend(fragments)
         return "pass_fragmented", len(segs), len(segs), ""
     ex_cjk = len(_CJK.findall(str(excerpt))) / max(len(str(excerpt)), 1)
     tx_cjk = len(_CJK.findall(text_norm)) / max(len(text_norm), 1)
     ok, first_bad = 0, ""
-    for seg, matched in zip(segs, exact):
-        if matched:
-            ok += 1; continue
-        sm = difflib.SequenceMatcher(None, text_norm, seg, autojunk=False)
-        m = sm.find_longest_match(0, len(text_norm), 0, len(seg))
-        if m.size / len(seg) >= near:
+    for seg, hit in zip(segs, exact):
+        end = hit + len(seg)
+        if hit < 0:
+            sm = difflib.SequenceMatcher(None, text_norm, seg, autojunk=False)
+            m = sm.find_longest_match(0, len(text_norm), 0, len(seg))
+            if m.size / len(seg) >= near:
+                hit, end = m.a, m.a + m.size
+        if hit >= 0:
             ok += 1
+            if spans is not None:
+                spans.append((hit, end))
         elif not first_bad:
             first_bad = seg[:120]
     if ok == len(segs):
@@ -305,6 +343,89 @@ def check_excerpt(pdf_text, excerpt, near=0.8):
     if ok == 0 and ((ex_cjk > 0.3 and tx_cjk < 0.05) or (ex_cjk < 0.05 and tx_cjk > 0.3)):
         return "language_mismatch", len(segs), ok, first_bad   # model probably translated instead of quoting
     return ("partial" if ok else "fail"), len(segs), ok, first_bad
+
+
+def _join_pdf_pages(pages):
+    # Markdown chunks already have a page separator. Plain text needs a line
+    # break so a trailing hyphen is recognized by the existing normalizer.
+    return [text if i == len(pages) - 1 or text.endswith("\n") else text + "\n"
+            for i, (_, text) in enumerate(pages)]
+
+
+def check_excerpt_with_pages(pdf_text, excerpt, pages=None, near=0.8):
+    """Return the legacy result plus ascending physical PDF page numbers."""
+    if not pages:
+        return (*check_excerpt(pdf_text, excerpt, near), "")
+
+    chunks = [text for _, text in pages]
+    if pdf_text != "".join(chunks):
+        chunks = _join_pdf_pages(pages)
+    normalized_chunks = [_normalize_unicode(chunk) for chunk in chunks]
+    boundaries = [0]
+    for chunk in normalized_chunks:
+        boundaries.append(boundaries[-1] + len(chunk))
+    prepared = _clean_search_text("".join(normalized_chunks), boundaries)
+    spans = []
+    located = _check_prepared_excerpt(prepared, excerpt, near, spans)
+    full = _prepare_search_text(pdf_text)
+    result = located if full == prepared else _check_prepared_excerpt(full, excerpt, near)
+    verified = {"pass", "pass_fragmented"}
+    if result[0] not in verified or located[0] not in verified:
+        return (*result, "")
+
+    non_space = [i for i, char in enumerate(prepared) if not char.isspace()]
+    offsets = [bisect_left(non_space, boundary) for boundary in boundaries]
+    matched = {
+        page for (page, _), start, end in zip(pages, offsets, offsets[1:])
+        if start < end and any(left < end and start < right for left, right in spans)
+    }
+    return (*result, ",".join(str(page) for page in sorted(matched)))
+
+
+def load_pdf_pages(path):
+    """Read per-page text in PDF order, retaining empty pages and physical numbers."""
+    p = Path(path)
+    if p.suffix.lower() == ".txt":
+        return []
+    try:
+        import pymupdf4llm
+        chunks = pymupdf4llm.to_markdown(str(p), page_chunks=True)
+        pages = []
+        for index, chunk in enumerate(chunks, 1):
+            metadata = chunk.get("metadata") or {}
+            number = int(metadata.get("page_number") or metadata.get("page") or index)
+            pages.append((number if number > 0 else index, chunk.get("text") or ""))
+        if any(text.strip() for _, text in pages):
+            return pages
+    except Exception:
+        pass
+    try:
+        import pdfplumber
+        with pdfplumber.open(p) as pdf:
+            pages = [(i, page.extract_text() or "") for i, page in enumerate(pdf.pages, 1)]
+        if any(text.strip() for _, text in pages):
+            # Match the legacy pdfplumber full-text separator exactly.
+            return [(i, text + ("\n" if i < len(pages) else "")) for i, text in pages]
+    except Exception:
+        pass
+    try:
+        import pymupdf
+        with pymupdf.open(p) as pdf:
+            pages = [(i, page.get_text()) for i, page in enumerate(pdf, 1)]
+        if any(text.strip() for _, text in pages):
+            return pages
+    except Exception:
+        pass
+    return []
+
+
+def load_pdf_text_and_pages(path):
+    """Load a single representation for both verification and page lookup."""
+    if Path(path).suffix.lower() == ".txt":
+        return load_pdf_text(path), []
+    pages = load_pdf_pages(path)
+    return "".join(text for _, text in pages), pages
+
 
 def load_pdf_text(path):
     p = Path(path)

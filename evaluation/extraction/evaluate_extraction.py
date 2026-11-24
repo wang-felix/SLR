@@ -100,6 +100,11 @@ def main():
         e = pd.read_csv(a.excerpt_check)
         vc = e.status.value_counts().to_dict()
         chk = e[e.status.isin(["pass", "partial", "fail"])]; n = len(chk)
+        if "matched_pages" in e.columns:
+            verified = e[e.status.isin(["pass", "pass_fragmented"])]
+            located = verified["matched_pages"].dropna().astype(str).str.strip().ne("").sum()
+            L += [f"- 已定位到具体页码：{located}/{len(verified)} 篇（分母为 pass 与 pass_fragmented）。",
+                  "- 页码表示引句在 PDF 文本中的匹配位置，内容是否支撑抽取结论仍需人工核对。"]
         L += [f"- 状态分布:{vc}"]
         if n:
             L += [f"- 完全核实:{pct(int((chk.status == 'pass').sum()), n)}",

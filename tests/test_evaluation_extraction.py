@@ -192,6 +192,98 @@ def test_excerpt_checker_distinguishes_locations_and_checks_only_the_quote(tmp_p
     assert checked["status"].tolist() == ["location_only", "not_found", "pass"]
     assert checked["location"].tolist() == [location_only, "", location]
     assert checked["n_segments"].tolist() == checked["n_verified"].tolist() == [0, 0, 1]
+    assert checked["matched_pages"].tolist() == ["", "", ""]
+
+
+@pytest.mark.parametrize(
+    ("page_texts", "quote", "status", "expected_pages"),
+    [
+        (["Unrelated page.", "The thermal spray formed a uniform ceramic layer."],
+         "The thermal spray formed a uniform ceramic layer.", "pass", "2"),
+        (["The sample was measured", "after the immersion test."],
+         "The sample was measured after the immersion test.", "pass", "1,2"),
+        (["The specimen surface was charac-", "2 of 2\n_Coatings_ **2021**, _11_, 459\nterized using microscopy."],
+         "The specimen surface was characterized using microscopy.", "pass", "1,2"),
+        (["The surface was coated with alumina.", "Intervening text.", "The immersion time was six hours."],
+         "The surface was coated with alumina.; The immersion time was six hours.", "pass", "1,3"),
+        (["Unrelated page.", "The ceramic coating remained intact after the test."],
+         "The ceramic coating remained intact after the tests.", "pass", "2"),
+        (["The ceramic coating."], "A sentence about an unrelated process.", "fail", ""),
+        (["The ceramic coating."], "The ceramic coating.; An unrelated process was used.", "partial", ""),
+        (["The ceramic coating."], "这是一句只出现在译文里的完全不同的话", "language_mismatch", ""),
+        (["The ceramic coating."], "", "no_excerpt", ""),
+        (["The ceramic coating."], "short", "too_short", ""),
+    ],
+)
+def test_excerpt_page_locations_keep_existing_statuses(page_texts, quote, status, expected_pages):
+    text = "\n".join(page_texts)
+    pages = list(enumerate(page_texts, 1))
+    legacy = utils.check_excerpt(text, quote)
+    assert legacy[0] == status
+    assert utils.check_excerpt_with_pages(text, quote, pages) == (*legacy, expected_pages)
+    assert utils.check_excerpt_with_pages(text, quote) == (*legacy, "")
+
+
+def test_excerpt_keeps_whole_text_unicode_normalization_at_page_boundary():
+    pages = [(1, "The article used the symbol A"), (2, "\u030a to measure the film.")]
+    text = "".join(page for _, page in pages)
+    quote = "The article used the symbol Å to measure the film."
+    assert utils.check_excerpt(text, quote, near=1) == ("pass", 1, 1, "")
+    assert utils.check_excerpt_with_pages(text, quote, pages, near=1) == ("pass", 1, 1, "", "")
+
+
+@pytest.mark.parametrize("across_pages", [False, True])
+def test_fragmented_excerpt_maps_matched_fragments_around_caption(across_pages):
+    first = "The coated samples were cut into small strips and carefully cleaned"
+    last = "then they were exposed to sodium chloride solution for twelve hours"
+    caption = "Figure 3 shows the apparatus."
+    if across_pages:
+        texts = [first, caption, last]
+        expected = "1,3"
+    else:
+        texts = ["Unrelated page.", "\n".join((first, caption, last))]
+        expected = "2"
+    result = utils.check_excerpt_with_pages("\n".join(texts), f"{first} {last}", list(enumerate(texts, 1)))
+    assert result == ("pass_fragmented", 1, 1, "", expected)
+
+
+def test_excerpt_checker_cli_maps_pages_from_synthetic_pdf(tmp_path):
+    pymupdf = pytest.importorskip("pymupdf")
+    script = Path(__file__).resolve().parents[1] / "evaluation" / "extraction" / "check_excerpts.py"
+    path = tmp_path / "synthetic.pdf"
+    texts = [
+        "The coating was fabricated by thermal spraying.\nThe sample was measured",
+        "after the immersion test.\nThe surface was charac-",
+        "terized using optical microscopy.\nThe immersion time was six hours.",
+    ]
+    with pymupdf.open() as pdf:
+        for text in texts:
+            pdf.new_page().insert_text((72, 72), text)
+        pdf.save(path)
+
+    table = tmp_path / "extraction.csv"
+    pd.DataFrame({
+        "Filename": [path.name] * 5 + ["missing.pdf"],
+        "Source Section Table or Text Excerpt": [
+            "The immersion time was six hours.",
+            "The sample was measured after the immersion test.",
+            "The surface was characterized using optical microscopy.",
+            "The coating was fabricated by thermal spraying.; The immersion time was six hours.",
+            "The film was examined in a vacuum chamber.",
+            "The immersion time was six hours.",
+        ],
+    }).to_csv(table, index=False)
+    result = subprocess.run(
+        [sys.executable, str(script), str(table), "--pdf-dir", str(tmp_path)],
+        cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    checked = pd.read_csv(tmp_path / "excerpt_check.csv", keep_default_na=False)
+    assert checked.columns.tolist() == [
+        "filename", "status", "n_segments", "n_verified", "first_unverified_segment", "location", "matched_pages",
+    ]
+    assert checked["status"].tolist() == ["pass"] * 4 + ["fail", "pdf_missing"]
+    assert checked["matched_pages"].tolist() == ["3", "1,2", "2,3", "1,3", "", ""]
+    assert "verified excerpts with matched pages: 4/4" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -259,15 +351,22 @@ def test_extraction_sample_and_evaluation_use_human_answers(tmp_path, reference,
     ]
     labels.to_excel(labels_path, sheet_name="标注表", index=False)
 
+    checks = tmp_path / "excerpt_check.csv"
+    data = {"status": ["pass", "pass_fragmented", "fail"]}
+    if expected_score == "exact":
+        data["matched_pages"] = ["3,4", "", ""]
+    pd.DataFrame(data).to_csv(checks, index=False)
+
     subprocess.run(
         [sys.executable, "-X", "utf8", str(scripts / "evaluate_extraction.py"),
-         str(labels_path), str(tmp_path / "extraction_key.csv")],
+         str(labels_path), str(tmp_path / "extraction_key.csv"), "--excerpt-check", str(checks)],
         cwd=tmp_path, check=True, capture_output=True, text=True,
     )
 
     material = pd.read_csv(tmp_path / "material_comparison.csv", keep_default_na=False).iloc[0]
     assert material["score"] == expected_score
     report = (tmp_path / "report_extraction.md").read_text(encoding="utf-8")
+    assert ("已定位到具体页码：1/2 篇" in report) == (expected_score == "exact")
     if expected_score == "review":
         assert "自动评分 0 篇，待复核 1 篇" in report
         assert material["review_reason"] and not material["extra"]
