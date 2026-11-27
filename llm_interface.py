@@ -15,6 +15,7 @@ import re
 import threading
 import time
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +25,44 @@ from url_privacy import redact_url
 from atomic_files import atomic_open
 
 logger = logging.getLogger(__name__)
+
+_call_usage = ContextVar("llm_call_usage", default=None)
+
+
+def _record_usage(prompt, completion, total) -> None:
+    records = _call_usage.get()
+    if records is not None:
+        records.append((prompt, completion, total))
+
+
+def _record_provider_usage(usage, prompt_key="prompt_tokens",
+                           completion_key="completion_tokens", total_key="total_tokens") -> int:
+    def count(key):
+        if key is None:
+            return None
+        if isinstance(usage, dict):
+            return usage.get(key)
+        return getattr(usage, key, None)
+
+    prompt, completion, total = count(prompt_key), count(completion_key), count(total_key)
+    if total_key is None:
+        total = (prompt or 0) + (completion or 0)
+    if usage is not None:
+        audit_total = total
+        if audit_total is None and prompt is not None and completion is not None:
+            audit_total = prompt + completion
+        _record_usage(prompt, completion, audit_total)
+    return total or 0
+
+
+def _usage_metadata(records, fallback_total=None):
+    if not records:
+        return {"prompt_tokens": None, "completion_tokens": None,
+                "total_tokens": fallback_total}
+    return {
+        name: sum(values) if all(value is not None for value in values) else None
+        for name, values in zip(("prompt_tokens", "completion_tokens", "total_tokens"), zip(*records))
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -651,7 +690,7 @@ class OpenAIProvider(LLMProvider):
                 max_tokens=max_tokens,
                 **kwargs,
             )
-            tokens = resp.usage.total_tokens if resp.usage else 0
+            tokens = _record_provider_usage(getattr(resp, "usage", None))
             return resp.choices[0].message.content, tokens
         except Exception as e:
             logger.error("OpenAI error (%s)", categorize_llm_error(e))
@@ -687,7 +726,8 @@ class AnthropicProvider(LLMProvider):
                 system=system_msg,
                 messages=user_msgs,
             )
-            tokens = (resp.usage.input_tokens + resp.usage.output_tokens) if resp.usage else 0
+            tokens = _record_provider_usage(getattr(resp, "usage", None),
+                                            "input_tokens", "output_tokens", None)
             return resp.content[0].text, tokens
         except Exception as e:
             logger.error("Anthropic error (%s)", categorize_llm_error(e))
@@ -765,13 +805,20 @@ class GeminiProvider(LLMProvider):
         usage = cls._attr(response, "usage_metadata") or cls._attr(response, "usageMetadata")
         if not usage:
             return 0
-        for name in ("total_token_count", "totalTokenCount"):
-            value = cls._attr(usage, name)
-            if value is not None:
-                return int(value)
-        input_tokens = cls._attr(usage, "prompt_token_count", cls._attr(usage, "promptTokenCount", 0)) or 0
-        output_tokens = cls._attr(usage, "candidates_token_count", cls._attr(usage, "candidatesTokenCount", 0)) or 0
-        return int(input_tokens) + int(output_tokens)
+        prompt = cls._attr(usage, "prompt_token_count", cls._attr(usage, "promptTokenCount"))
+        candidates = cls._attr(usage, "candidates_token_count", cls._attr(usage, "candidatesTokenCount"))
+        thoughts = cls._attr(usage, "thoughts_token_count", cls._attr(usage, "thoughtsTokenCount"))
+        reported_total = cls._attr(usage, "total_token_count")
+        if reported_total is None:
+            reported_total = cls._attr(usage, "totalTokenCount")
+        total = int(reported_total) if reported_total is not None else int(prompt or 0) + int(candidates or 0)
+        completion = int(candidates) + int(thoughts or 0) if candidates is not None else None
+        prompt = int(prompt) if prompt is not None else None
+        audit_total = total if reported_total is not None else (
+            prompt + completion if prompt is not None and completion is not None else None
+        )
+        _record_usage(prompt, completion, audit_total)
+        return total
 
     @classmethod
     def _response_text(cls, response: Any) -> str:
@@ -844,7 +891,8 @@ class GeminiProvider(LLMProvider):
                     max_output_tokens=effective_max_tokens,
                 )
                 resp = self._client.generate_content(prompt, generation_config=cfg)
-            return self._response_text(resp), self._usage_tokens(resp)
+            tokens = self._usage_tokens(resp)
+            return self._response_text(resp), tokens
         except Exception as e:
             logger.error("Gemini error (%s)", categorize_llm_error(e))
             raise
@@ -886,6 +934,7 @@ class OllamaProvider(LLMProvider):
             body = resp.json()
             text = body.get("message", {}).get("content", "")
             tokens = body.get("eval_count", 0) + body.get("prompt_eval_count", 0)
+            _record_usage(body.get("prompt_eval_count"), body.get("eval_count"), tokens)
             return text, tokens
         except Exception as e:
             logger.error("Ollama error (%s)", categorize_llm_error(e))
@@ -948,7 +997,7 @@ class OpenAICompatibleProvider(LLMProvider):
             )
             resp.raise_for_status()
             body = resp.json()
-            tokens = body.get("usage", {}).get("total_tokens", 0)
+            tokens = _record_provider_usage(body.get("usage"))
             return body["choices"][0]["message"]["content"], tokens
         except Exception as e:
             logger.error("%s error (%s)", self.display_name, categorize_llm_error(e))
@@ -1106,12 +1155,20 @@ class LLMManager:
         total_backoff_wait = 0.0
         retry_count = 0
         last_category = None
+        usage_records = []
+
+        def tracked_operation():
+            token = _call_usage.set(usage_records)
+            try:
+                return operation()
+            finally:
+                _call_usage.reset(token)
 
         for attempt_index in range(max_attempts):
             if stop_event is not None and stop_event.is_set():
                 raise InterruptedError('Stopped by user')
             try:
-                result, wait_seconds = self.rate_limiter.run(operation, stop_event=stop_event)
+                result, wait_seconds = self.rate_limiter.run(tracked_operation, stop_event=stop_event)
                 total_rate_limit_wait += wait_seconds
                 metadata = {
                     "provider": self.provider_name,
@@ -1124,6 +1181,7 @@ class LLMManager:
                     "attempt_count": attempt_index + 1,
                     "final_status": "success",
                     "error_category": last_category,
+                    **_usage_metadata(usage_records, result[1]),
                 }
                 self._set_last_call_metadata(metadata)
                 return result
@@ -1152,6 +1210,7 @@ class LLMManager:
                         "attempt_count": attempt_index + 1,
                         "final_status": final_status,
                         "error_category": category,
+                        **_usage_metadata(usage_records),
                     }
                     self._set_last_call_metadata(metadata)
                     if final_status == "failed_retry_exhausted":
@@ -1183,9 +1242,10 @@ class LLMManager:
 
     def get_last_call_metadata(self) -> Dict[str, Any]:
         local_metadata = getattr(self._thread_local, "last_call_metadata", None)
-        return dict(local_metadata or self.last_call_metadata)
+        return dict(self.last_call_metadata if local_metadata is None else local_metadata)
 
     def chat_completion_with_tokens(self, messages, **kwargs) -> Tuple[str, int]:
+        self._thread_local.last_call_metadata = {}
         retry_options = self._pop_retry_options(kwargs)
         return self._execute_with_retry(
             lambda: self.provider.chat_completion_with_tokens(messages, **kwargs),
@@ -1210,6 +1270,7 @@ class LLMManager:
         Structured calls may return token count 0 when the wrapped provider
         client does not expose usage in the parsed response.
         """
+        self._thread_local.last_call_metadata = {}
         try:
             import instructor
             from instructor.core import InstructorRetryException
@@ -1223,6 +1284,29 @@ class LLMManager:
         adapter = self.profile["adapter"]
 
         retry_options = self._pop_retry_options(kwargs)
+
+        usage_keys = (
+            ("input_tokens", "output_tokens", None) if adapter == "native_anthropic"
+            else ("prompt_tokens", "completion_tokens", "total_tokens")
+        )
+
+        def unpack(result):
+            if isinstance(result, tuple):
+                parsed, completion = result
+                usage = getattr(completion, "usage", None)
+                total_key = usage_keys[2]
+                if total_key is None:
+                    tokens = int(getattr(usage, "input_tokens", 0) or 0) + int(
+                        getattr(usage, "output_tokens", 0) or 0
+                    )
+                else:
+                    tokens = int(getattr(usage, total_key, 0) or 0)
+            else:
+                parsed, tokens = result, 0
+                usage = getattr(getattr(parsed, "_raw_response", None), "usage", None)
+            aggregate = getattr(parsed, "_total_usage", None)
+            _record_provider_usage(aggregate if aggregate is not None else usage, *usage_keys)
+            return parsed, tokens
 
         def operation():
             if adapter in ("native_openai", "openai_compatible", "native_ollama"):
@@ -1252,10 +1336,7 @@ class LLMManager:
                             if pname == "DeepSeek" else None
                         ),
                     )
-                    if isinstance(result, tuple):
-                        resp, completion = result
-                        return resp, int(getattr(getattr(completion, 'usage', None), 'total_tokens', 0) or 0)
-                    return result, 0
+                    return unpack(result)
                 finally:
                     raw_client.close()
 
@@ -1273,11 +1354,7 @@ class LLMManager:
                         system=system_content, messages=[m for m in messages if m['role'] != 'system'],
                         response_model=response_model, max_retries=1,
                     )
-                    if isinstance(result, tuple):
-                        resp, completion = result
-                        usage = getattr(completion, 'usage', None)
-                        return resp, int(getattr(usage, 'input_tokens', 0) or 0) + int(getattr(usage, 'output_tokens', 0) or 0)
-                    return result, 0
+                    return unpack(result)
                 finally:
                     raw_client.close()
 
@@ -1286,8 +1363,15 @@ class LLMManager:
                 "Falling back to JSON parse."
             )
 
+        def tracked_structured_operation():
+            try:
+                return operation()
+            except InstructorRetryException as exc:
+                _record_provider_usage(getattr(exc, "total_usage", None), *usage_keys)
+                raise
+
         try:
-            return self._execute_with_retry(operation, **retry_options)
+            return self._execute_with_retry(tracked_structured_operation, **retry_options)
         except InstructorRetryException as exc:
             raise RuntimeError(f"instructor structured output failed: {exc}") from exc
 

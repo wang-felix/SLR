@@ -6,6 +6,7 @@ housing_enhanced.py is kept as the module name for import compatibility.
 
 import os
 import csv
+import inspect
 import re
 import time
 import threading
@@ -335,6 +336,10 @@ class SystematicReviewAutomation:
         self.dry_run = bool(adv.get('dry_run', False))
         self.skip_pages = int(adv.get('skip_pages', 0))
         self.output_format = adv.get('output_format', 'both')
+        self.include_extraction_quotes = bool(adv.get('include_extraction_quotes', True))
+        self.extraction_mode = adv.get('extraction_mode', 'optimized')
+        if self.extraction_mode not in ('optimized', 'raw'):
+            raise ValueError("extraction_mode must be 'optimized' or 'raw'")
         self.include_excluded = bool(adv.get('include_excluded', True))
         self.flag_confidence_threshold = adv.get('flag_confidence_threshold')
         self.flag_confidence_scope = adv.get('flag_confidence_scope', 'all')
@@ -564,7 +569,7 @@ class SystematicReviewAutomation:
     def _extraction_prompt_fingerprint_source(self) -> Dict[str, Any]:
         return {
             'prompt': self.extraction_prompt,
-            'quote_then_answer': True,
+            'quote_then_answer': self.extraction_mode == 'optimized',
             'fields': self.extraction_fields,
         }
 
@@ -611,6 +616,8 @@ class SystematicReviewAutomation:
         text_input: TextInputMetadata,
         stage: str = None,
         tokens: int = 0,
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
         decision: str = None,
         status: str = "ok",
         parse_status: str = "ok",
@@ -660,6 +667,13 @@ class SystematicReviewAutomation:
             'rate_limit_wait_seconds': round(float(rate_limit_wait_seconds or 0.0), 6),
             'backoff_wait_seconds': round(float(backoff_wait_seconds or 0.0), 6),
         }
+        if kind == 'extraction':
+            event.update(
+                extraction_mode=self.extraction_mode,
+                prompt_tokens=0 if cache_hit else prompt_tokens,
+                completion_tokens=0 if cache_hit else completion_tokens,
+                total_tokens=tokens,
+            )
         if error_category:
             event['error_category'] = error_category
         if review_routing:
@@ -691,7 +705,9 @@ class SystematicReviewAutomation:
             extraction = {'plain_json': {'temperature': self.temperature, 'max_tokens': self.max_output_tokens}}
             profile = getattr(self.llm_manager, 'profile', None) or {}
             adapter = profile.get('adapter')
-            if adapter in ('native_openai', 'openai_compatible', 'native_ollama', 'native_anthropic'):
+            if self.extraction_mode == 'raw':
+                extraction['mode'] = 'raw'
+            elif adapter in ('native_openai', 'openai_compatible', 'native_ollama', 'native_anthropic'):
                 extraction['structured'] = {
                     'temperature': 'not_sent' if adapter == 'native_anthropic' else self.temperature,
                     'max_tokens': self.max_output_tokens,
@@ -1048,6 +1064,25 @@ class SystematicReviewAutomation:
         # Primary: PyMuPDF4LLM — academic-grade PDF → Markdown conversion
         try:
             import pymupdf4llm
+            converter = pymupdf4llm.to_markdown
+            options = {}
+            try:
+                parameters = inspect.signature(converter).parameters
+                if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+                    # The 2.x wrapper delegates to one of two implementations.
+                    if getattr(pymupdf4llm, '_use_layout', False):
+                        implementation = getattr(pymupdf4llm, '_layout_to_markdown', None)
+                    else:
+                        rag = getattr(getattr(pymupdf4llm, 'helpers', None), 'pymupdf_rag', None)
+                        implementation = getattr(rag, 'to_markdown', None)
+                    if callable(implementation):
+                        parameters = {**inspect.signature(implementation).parameters, **parameters}
+                options = {name: False for name in ('use_ocr', 'show_progress')
+                           if name in parameters and parameters[name].kind in (
+                               inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD
+                           )}
+            except (TypeError, ValueError):
+                pass
             if self.skip_pages:
                 import pymupdf
                 with pymupdf.open(pdf_path) as document:
@@ -1055,9 +1090,8 @@ class SystematicReviewAutomation:
                 if not pages:
                     self._record_text_extraction_metadata(pdf_path, method='pymupdf4llm', status='no_extractable_text')
                     return 'Error: No pages remain after skipping cover pages', False
-                md_text = pymupdf4llm.to_markdown(str(pdf_path), pages=pages)
-            else:
-                md_text = pymupdf4llm.to_markdown(str(pdf_path))
+                options['pages'] = pages
+            md_text = converter(str(pdf_path), **options)
             if md_text.strip():
                 if self.strip_references:
                     md_text = self._strip_references_from_md(md_text)
@@ -1437,6 +1471,32 @@ class SystematicReviewAutomation:
     def extract_data(self, text: str, filename: str) -> ExtractionResult:
         start = time.time()
         tokens = 0
+        token_splits = {}
+        self._llm_thread_local.metadata = {}
+
+        def call_and_track(call, *args, **kwargs):
+            nonlocal tokens
+            self._llm_thread_local.metadata = {}
+            fallback_total = None
+            try:
+                result, fallback_total = call(*args, **kwargs)
+                return result
+            finally:
+                metadata = self._llm_thread_local.metadata
+                call_total = metadata.get('total_tokens')
+                if call_total is None:
+                    call_total = fallback_total
+                if call_total is not None:
+                    tokens += call_total
+                    with self._lock:
+                        self.stats['total_api_tokens'] += call_total
+                if call_total is not None or any(metadata.get(key) is not None
+                                                 for key in ('prompt_tokens', 'completion_tokens')):
+                    for key in ('prompt_tokens', 'completion_tokens'):
+                        count = metadata.get(key)
+                        previous = token_splits.get(key, 0)
+                        token_splits[key] = previous + count if previous is not None and count is not None else None
+
         raw = None
         first_failed_raw = None
         parse_retry_count = 0
@@ -1477,36 +1537,35 @@ class SystematicReviewAutomation:
 
             chunk = self._prepare_text_input(text, stage_key, text_input, precomputed_snippet=precomputed_snippet)
 
-            # Build Quote-Then-Answer prompt — forces the model to ground each
-            # extracted value in a verbatim sentence from the paper.
-            qa_lines = []
-            for f in self.extraction_fields:
-                safe = f.lower().replace(" ", "_").replace("-", "_")
-                qa_lines.extend([
-                    f'    {json.dumps(safe + "_quote")}: "verbatim sentence(s) from the text",',
-                    f'    {json.dumps(safe)}: "extracted value, or Not reported",',
-                ])
-            qa_prompt = (
-                _render_paper_prompt(self.extraction_prompt, chunk) + "\n\n"
-                "Apply the Quote-Then-Answer method for every field:\n"
-                "  1. Copy a verbatim sentence from the paper as the field_quote.\n"
-                "  2. Write the extracted value based ONLY on that quote.\n"
-                "  3. If no relevant text exists, set both field_quote and field to 'Not reported'.\n\n"
-                "Return ONLY valid JSON (no prose, no markdown fences):\n"
-                "{\n" + "\n".join(qa_lines).rstrip(',') + "\n}"
-            )
+            extraction_prompt = _render_paper_prompt(self.extraction_prompt, chunk)
+            if self.extraction_mode == 'optimized':
+                qa_lines = []
+                for f in self.extraction_fields:
+                    safe = f.lower().replace(" ", "_").replace("-", "_")
+                    qa_lines.extend([
+                        f'    {json.dumps(safe + "_quote")}: "verbatim sentence(s) from the text",',
+                        f'    {json.dumps(safe)}: "extracted value, or Not reported",',
+                    ])
+                extraction_prompt += (
+                    "\n\nApply the Quote-Then-Answer method for every field:\n"
+                    "  1. Copy a verbatim sentence from the paper as the field_quote.\n"
+                    "  2. Write the extracted value based ONLY on that quote.\n"
+                    "  3. If no relevant text exists, set both field_quote and field to 'Not reported'.\n\n"
+                    "Return ONLY valid JSON (no prose, no markdown fences):\n"
+                    "{\n" + "\n".join(qa_lines).rstrip(',') + "\n}"
+                )
             messages = [
                 {"role": "system", "content": "You extract structured data from research papers. Return only valid JSON."},
-                {"role": "user",   "content": qa_prompt},
+                {"role": "user",   "content": extraction_prompt},
             ]
 
             # Attempt structured output via instructor (enforces schema + auto-retries)
-            schema = self._generate_dynamic_schema()
-            data, tokens = None, 0
+            schema = self._generate_dynamic_schema() if self.extraction_mode == 'optimized' else None
+            data = None
             if schema is not None:
                 try:
                     failure_stage = 'structured'
-                    structured, tokens = self._llm_structured_call(messages, schema)
+                    structured = call_and_track(self._llm_structured_call, messages, schema)
                     if structured is not None:
                         data = structured.model_dump()
                 except InterruptedError:
@@ -1523,12 +1582,10 @@ class SystematicReviewAutomation:
                 for attempt in range(PARSE_RETRY_LIMIT + 1):
                     failure_stage = 'request'
                     raw = None
-                    raw, attempt_tokens = self._llm_call(
+                    raw = call_and_track(
+                        self._llm_call,
                         messages, temperature=self.temperature, max_tokens=self.max_output_tokens,
                     )
-                    tokens = tokens + attempt_tokens if attempt else attempt_tokens
-                    with self._lock:
-                        self.stats['total_api_tokens'] += attempt_tokens
                     failure_stage = 'parse'
                     try:
                         data = _parse_json_response(raw)
@@ -1544,9 +1601,6 @@ class SystematicReviewAutomation:
                             break
                     first_failed_raw = raw
                     parse_retry_count += 1
-            else:
-                with self._lock:
-                    self.stats['total_api_tokens'] += tokens
             llm_metadata = self._audit_llm_metadata()
             failure_stage = 'validation'
             if not isinstance(data, dict) or not any(
@@ -1583,6 +1637,7 @@ class SystematicReviewAutomation:
                 tokens=tokens,
                 parse_retry_count=parse_retry_count,
                 retry_first_raw_response=first_failed_raw,
+                **token_splits,
                 **llm_metadata,
             )
             return result
@@ -1608,6 +1663,7 @@ class SystematicReviewAutomation:
                 error=safe_error,
                 tokens=tokens,
                 failure_stage=failure_stage,
+                **token_splits,
                 parse_retry_count=parse_retry_count,
                 raw_response=raw,
                 retry_first_raw_response=first_failed_raw,
@@ -1783,12 +1839,34 @@ class SystematicReviewAutomation:
     def _extraction_base_headers(self) -> List[str]:
         return ["filename"] + self.extraction_fields + ["processing_time", "api_tokens_used"]
 
+    def _extraction_quote_columns(self) -> Dict[str, str]:
+        if not self.include_extraction_quotes:
+            return {}
+        headers = self._extraction_base_headers()
+        used = {self._excel_column_title(name) for name in headers}
+        available = {key for result in self.extraction_results for key in result.fields}
+        columns = {}
+        for field_name in self.extraction_fields:
+            quote = f"{field_name}_quote"
+            if quote not in available or quote in headers:
+                continue
+            column = quote
+            suffix = 2
+            while self._excel_column_title(column) in used:
+                column = f"{quote}_{suffix}"
+                suffix += 1
+            columns[quote] = column
+            used.add(self._excel_column_title(column))
+        return columns
+
     @staticmethod
     def _excel_column_title(name: str) -> str:
         return name.replace('_', ' ').title()
 
-    def _extraction_metadata_columns(self) -> Dict[str, str]:
-        used = {self._excel_column_title(name) for name in self._extraction_base_headers()}
+    def _extraction_metadata_columns(self, headers=None) -> Dict[str, str]:
+        if headers is None:
+            headers = self._extraction_base_headers() + list(self._extraction_quote_columns().values())
+        used = {self._excel_column_title(name) for name in headers}
         columns = {}
         for name in TEXT_INPUT_COLUMNS:
             column = name
@@ -1803,11 +1881,13 @@ class SystematicReviewAutomation:
             columns[name] = column
         return columns
 
-    def _extraction_row(self, result: ExtractionResult, metadata_columns: Dict[str, str]) -> Dict[str, Any]:
+    def _extraction_row(self, result: ExtractionResult, metadata_columns: Dict[str, str],
+                        quote_columns: Dict[str, str]) -> Dict[str, Any]:
         row = {'filename': result.filename,
                'processing_time': round(result.processing_time, 2),
                'api_tokens_used': result.api_tokens_used}
         row.update(result.fields)
+        row.update({column: result.fields.get(quote, "") for quote, column in quote_columns.items()})
         row.update({column: getattr(result, name) for name, column in metadata_columns.items()})
         return row
 
@@ -1843,13 +1923,15 @@ class SystematicReviewAutomation:
 
     def write_extraction_csv(self):
         try:
-            metadata_columns = self._extraction_metadata_columns()
-            headers = self._extraction_base_headers() + list(metadata_columns.values())
+            quote_columns = self._extraction_quote_columns()
+            headers = self._extraction_base_headers() + list(quote_columns.values())
+            metadata_columns = self._extraction_metadata_columns(headers)
+            headers += list(metadata_columns.values())
             with atomic_open(self.extraction_csv, 'w', newline='', encoding='utf-8') as f:
                 w = csv.DictWriter(f, fieldnames=headers, extrasaction='ignore')
                 w.writeheader()
                 for r in self.extraction_results:
-                    w.writerow(csv_row(self._extraction_row(r, metadata_columns)))
+                    w.writerow(csv_row(self._extraction_row(r, metadata_columns, quote_columns)))
         except Exception as e:
             self.logger.error(f"Extraction CSV: {e}")
             raise
@@ -1900,13 +1982,15 @@ class SystematicReviewAutomation:
             wb      = Workbook()
             ws      = wb.active
             ws.title = "Extracted Data"
-            metadata_columns = self._extraction_metadata_columns()
+            quote_columns = self._extraction_quote_columns()
+            headers = self._extraction_base_headers() + list(quote_columns.values())
+            metadata_columns = self._extraction_metadata_columns(headers)
             metadata_headers = set(metadata_columns.values())
-            headers = self._extraction_base_headers() + list(metadata_columns.values())
+            headers += list(metadata_columns.values())
             self._excel_header(ws, headers)
 
             for ri, r in enumerate(self.extraction_results, 2):
-                row = self._extraction_row(r, metadata_columns)
+                row = self._extraction_row(r, metadata_columns, quote_columns)
                 for ci, h in enumerate(headers, 1):
                     value = row.get(h, "")
                     cell = ws.cell(row=ri, column=ci, value=value if h in metadata_headers else str(value))
