@@ -1,0 +1,4 @@
+study_design
+population_and_sample_size
+intervention_and_comparator
+outcomes_measured

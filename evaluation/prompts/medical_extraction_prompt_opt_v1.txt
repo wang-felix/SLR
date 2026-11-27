@@ -1,0 +1,18 @@
+Extract four fields from this trial report. Use only the supplied paper. Preserve units,
+arm labels and assessment times. Distinguish randomized, enrolled and analyzed counts.
+For each field, use Not reported when none of its elements are reported. For a partially
+reported field, extract the supported elements and identify any missing element without
+guessing. Do not infer evidence from cited studies.
+
+study_design: randomization unit and design (e.g. parallel, cluster, crossover), allocation
+and blinding as reported, plus setting and trial duration when stated.
+population_and_sample_size: clinical population and relevant eligibility, randomized
+total and per-arm counts, and analyzed counts if different. Match each count to its stage.
+intervention_and_comparator: describe each arm, including active treatment or usual care,
+dose or intensity, route or delivery, frequency and duration where applicable.
+outcomes_measured: identify the reported primary and secondary outcomes, the instruments
+or operational definitions and the assessment times. Distinguish primary from secondary
+when the trial does so. Do not report effect sizes, p-values or directions of effect.
+
+Paper:
+{text}
