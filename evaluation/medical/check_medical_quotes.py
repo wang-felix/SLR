@@ -16,6 +16,13 @@ from evaluation.medical.run_medical_eval import (
     write_csv, write_json,
 )
 
+_TYPOGRAPHIC_QUOTES = str.maketrans("\u2018\u2019\u201c\u201d", "''\"\"")
+
+
+def normalize_typographic_quotes(text):
+    """Map typographic quotes one-to-one, preserving character offsets."""
+    return text.translate(_TYPOGRAPHIC_QUOTES)
+
 
 def metric(count, denominator):
     return {"count": count, "denominator": denominator,
@@ -98,6 +105,8 @@ def check(dataset, output):
         if sha256(pdf) != run["pdf_sha256"][pid]:
             raise ValueError(f"PDF changed after the extraction run: {pid}")
         text, pages = load_pages(pdf)
+        text = normalize_typographic_quotes(text)
+        pages = [(number, normalize_typographic_quotes(content)) for number, content in pages]
         for group, predictions in groups.items():
             row = {"run_id": run["run_id"], "paper_id": pid, "group": group}
             for field in FIELDS:
@@ -105,7 +114,9 @@ def check(dataset, output):
                 quote = predictions[pid][field + "_quote"]
                 present = has_quote(quote)
                 if present:
-                    status, _, _, _, matched = check_excerpt_with_pages(text, quote, pages, near=1.0)
+                    status, _, _, _, matched = check_excerpt_with_pages(
+                        text, normalize_typographic_quotes(quote), pages, near=1.0,
+                    )
                 else:
                     status, matched = "no_excerpt", ""
                 abstention = "n/a"

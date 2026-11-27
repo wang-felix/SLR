@@ -282,6 +282,33 @@ def test_abstention_and_nonverbatim_quotes_do_not_raise_match_rate(dataset, tran
     assert result["verbatim_match"]["denominator"] == 2
 
 
+def test_typographic_quotes_are_strict_matches_on_the_correct_pdf_page(dataset, monkeypatch, tmp_path):
+    pdf = dataset / "pdfs" / "trial1.pdf"
+    original = "The participant’s response was recorded as “blue” at the ‘baseline’ visit."
+    quote = "The participant's response was recorded as \"blue\" at the 'baseline' visit."
+    with pymupdf.open() as document:
+        document.new_page().insert_text((72, 72), DESIGN)
+        document.new_page().insert_htmlbox(pymupdf.Rect(72, 72, 530, 145), original)
+        document.save(pdf)
+    text, pages = quotes.load_pages(pdf)
+    assert original in pages[1][1]
+    assert quotes.check_excerpt_with_pages(text, quote, pages, near=1.0)[0] != "pass"
+
+    run = {
+        "run_id": "typographic-quotes", "selected_ids": ["P001"],
+        "gold_sha256": runner.sha256(dataset / "gold_standard.csv"),
+        "pdf_sha256": {"P001": runner.sha256(pdf)},
+    }
+    prediction = dict.fromkeys(runner.OUTPUT_COLUMNS[3:], "")
+    prediction.update(outcomes_measured="Response at baseline", outcomes_measured_quote=quote)
+    monkeypatch.setattr(quotes, "load_run", lambda _: (run, {"G2": {"P001": prediction}}))
+
+    summary = quotes.check(dataset, tmp_path)
+    assert summary["groups"]["G2"]["strict_pass"] == quotes.metric(1, 1)
+    detail, = runner.read_csv(tmp_path / "l1_quotes.csv")
+    assert detail["outcomes_measured_matched_pages"] == "2"
+
+
 def test_fragmented_pass_contributes_to_verbatim_and_page_metrics():
     rows = [
         {"status": status, "matched_pages": pages, "has_quote": True, "abstention": "n/a"}
