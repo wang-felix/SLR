@@ -1,0 +1,38 @@
+Extract four fields from this trial report. Find all reported elements before selecting
+evidence, then support each element with the shortest continuous verbatim fragment.
+Use only the supplied paper. Preserve units, arm labels, and assessment times. If only
+some elements are reported, extract those without guessing the rest. If the field has
+no relevant source evidence, use Not reported for both its value and quote.
+
+study_design: Report the randomization unit and design, number of arms and clusters
+where applicable, allocation concealment, blinding, setting, active intervention
+duration, and total follow-up. Distinguish the two durations when they differ. In the
+quote, cover design and allocation, setting, and reported durations.
+
+population_and_sample_size: Report the clinical population, relevant inclusion and
+exclusion criteria, and the numbers randomized overall and by arm. Distinguish screened,
+enrolled, randomized, analyzed, and followed-up participants as reported. Verify
+sample sizes against arm labels and N or n values in complete table headers or total
+rows. Never treat a subgroup row such as Male as the arm total. If the abstract and
+body disagree, use the methods or results details for the corresponding stage and
+note the discrepancy. In the quote, cover eligibility and the key stage-specific counts.
+
+intervention_and_comparator: Describe all intervention and control arms, delivery
+method, frequency, dose or intensity, and duration when reported. For text messages,
+include automated or manual delivery and one-way or interactive communication when
+reported. In the quote, support both intervention and control arm descriptions.
+
+outcomes_measured: Report the designated primary and secondary outcomes, the tools or
+definitions used, and the measurement times for each. In the quote, cover the reported
+primary and key secondary outcomes and their assessment times. Omit effect sizes,
+p-values, and effect directions.
+
+Keep evidence fragments short, typically 10–35 words where practical. Join nonadjacent
+fragments with ' ... '. Preserve punctuation and inline citation markers. Where a
+page header or inserted column interrupts the text, split the evidence with ' ... '
+instead of silently deleting or rewriting text. For table-only evidence, copy the
+relevant Markdown header and data rows verbatim, joined with ' ... '. Do not reorder
+the cells or convert them into prose.
+
+Paper:
+{text}

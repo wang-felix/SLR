@@ -117,9 +117,9 @@ def evaluate_gates(run, l1, scores):
     more_expensive = Decimal(str(g2["peak_cny"])) > Decimal("2.5") * Decimal(str(g1["peak_cny"]))
     slower = Decimal(str(g2["elapsed_seconds"])) > Decimal("2.5") * Decimal(str(g1["elapsed_seconds"]))
     passed = {
-        "Wrong rate improves ≥5 pp, or stays at/below a baseline ≤3%": (
-            wrong_gain is not None and (wrong_gain >= Fraction(".05")
-                                         or wrong1 <= Fraction(".03") and wrong_gain >= 0)
+        "G2 Wrong rate does not worsen, and improves ≥5 pp or reaches ≤3%": (
+            wrong_gain is not None and wrong_gain >= 0
+            and (wrong_gain >= Fraction(".05") or wrong2 <= Fraction(".03"))
         ),
         "Exact rate does not decline": exact_delta is not None and exact_delta >= 0,
         "G2 verbatim quote match ≥80%": quote is not None and quote >= Fraction(".80"),

@@ -182,6 +182,30 @@ def test_full_offline_pipeline_and_resume(dataset, transports, tmp_path):
     assert all(term in report for term in ("strict pass", "fragmented pass", "verbatim match"))
 
 
+def test_prompt_file_changes_only_optimized_prompt_and_run_id(dataset, transports, tmp_path):
+    v2_prompt = runner.PROMPTS / "medical_extraction_prompt_opt_v2.txt"
+    old_output = tmp_path / "v1"
+    old = live(dataset, old_output, limit=1)
+    new = live(dataset, tmp_path / "v2", limit=1, prompt_file=v2_prompt)
+    assert old["prompt_file"] == runner.DEFAULT_PROMPT_FILE.name
+    assert new["prompt_file"] == v2_prompt.name
+    assert old["run_id"] != new["run_id"]
+    assert transports[0] == transports[2]
+    assert "Never treat a subgroup row" in transports[3][1][-1]["content"]
+
+    preflight = old_output / "dry_run_summary.json"
+    original = preflight.read_bytes()
+    with pytest.raises(ValueError, match="Use a new --output directory"):
+        live(dataset, old_output, limit=1, prompt_file=v2_prompt)
+    assert preflight.read_bytes() == original
+    assert len(transports) == 4
+
+    empty_prompt = tmp_path / "empty.txt"
+    empty_prompt.write_text(" \n", encoding="utf-8")
+    with pytest.raises(ValueError, match="prompt file is empty"):
+        runner.run(dataset, tmp_path / "dry", dry_run=True, prompt_file=empty_prompt)
+
+
 def test_full_size_blind_workbook_has_160_tasks(tmp_path, monkeypatch):
     ids = [f"P{number:03}" for number in range(1, 21)]
     gold = [{"paper_id": pid, "pdf_filename": f"{pid}.pdf",
@@ -338,6 +362,10 @@ def test_frozen_pass_and_stop_boundaries():
                            "physical_page": quotes.metric(64, 80)}}}
     scores = {"G1": group(45, 8, 0), "G2": group(45, 4, 68)}
     assert scoring.evaluate_gates(run, l1, scores)[0] == "PASS"
+    gate = "G2 Wrong rate does not worsen, and improves ≥5 pp or reaches ≤3%"
+    for wrong1, wrong2, expected in [(3, 1, True), (3, 2, True), (3, 3, False), (2, 3, False)]:
+        trial = {"G1": group(45, wrong1, 0), "G2": group(45, wrong2, 68)}
+        assert scoring.evaluate_gates(run, l1, trial)[1][gate] is expected
     assert scoring.evaluate_gates(run, l1, {**scores, "G2": group(45, 4, 51)})[0] == "STOP"
     assert scoring.evaluate_gates(run, l1, {**scores, "G2": group(44, 4, 68)})[0] == "STOP"
     slow = copy.deepcopy(run)

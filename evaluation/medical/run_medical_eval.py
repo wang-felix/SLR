@@ -35,6 +35,7 @@ MAX_OUTPUT = 4000
 MAX_CONTEXT = 1_048_576
 BUDGET_DEFAULT = Decimal("8")
 DEFAULT_MODEL = "deepseek-flash"
+DEFAULT_PROMPT_FILE = PROMPTS / "medical_extraction_prompt_opt_v1.txt"
 OFFICIAL_MODELS = {DEFAULT_MODEL, "deepseek-v4-pro"}
 SETTINGS = {"temperature": 0.05, "max_tokens": MAX_OUTPUT, "max_text_chars": LIMIT,
             "strip_references": True, "thinking": "disabled"}
@@ -279,22 +280,39 @@ def summarize_group(records, requests, selected):
             if len(records) == n else None}
 
 
+def load_prompt(prompt_file):
+    prompt = Path(prompt_file).read_text(encoding="utf-8")
+    if not prompt.strip():
+        raise ValueError(f"Optimization prompt file is empty: {prompt_file}")
+    return prompt
+
+
+def prepare_run(dataset, output, selected, model, prompt_file):
+    texts, report = preflight(dataset, output, selected, model)
+    report["prompt_file"] = Path(prompt_file).name
+    write_json(output / "dry_run_summary.json", report)
+    return texts, report
+
+
 def run(dataset, output, *, model=DEFAULT_MODEL, limit=None, dry_run=False,
-        rates=None, budget_cny=BUDGET_DEFAULT, api_key=""):
+        rates=None, budget_cny=BUDGET_DEFAULT, api_key="", prompt_file=DEFAULT_PROMPT_FILE):
+    if dry_run:
+        load_prompt(prompt_file)
     output.mkdir(parents=True, exist_ok=True)
     all_papers = load_gold(dataset)
     selected = all_papers[:limit]
     if not selected:
         raise ValueError("Select at least one paper")
     with exclusive_run(output):
-        texts, preflight_report = preflight(dataset, output, selected, model)
-        write_json(output / "dry_run_summary.json", preflight_report)
-        if dry_run or preflight_report["errors"] or preflight_report["truncated"]:
-            return preflight_report
-        return run_live(dataset, output, all_papers, selected, texts, model, rates, budget_cny, api_key)
+        if dry_run:
+            _, report = prepare_run(dataset, output, selected, model, prompt_file)
+            return report
+        return run_live(dataset, output, all_papers, selected, None, model, rates, budget_cny, api_key,
+                        prompt_file=prompt_file)
 
 
-def run_live(dataset, output, all_papers, selected, texts, model, rates, budget_cny, api_key):
+def run_live(dataset, output, all_papers, selected, texts, model, rates, budget_cny, api_key,
+             *, prompt_file=DEFAULT_PROMPT_FILE):
     if model not in OFFICIAL_MODELS or not api_key or not rates:
         raise ValueError("Live runs require an official DeepSeek model, DEEPSEEK_API_KEY and all four rates")
     rates = {key: Decimal(str(rates[key])) for key in RATE_NAMES}
@@ -303,7 +321,7 @@ def run_live(dataset, output, all_papers, selected, texts, model, rates, budget_
         raise ValueError("Rates and budget must be positive finite numbers")
     if any(rates[f"peak_{part}"] < rates[f"offpeak_{part}"] for part in ("input", "output")):
         raise ValueError("Peak rates must be at least the off-peak rates")
-    opt_prompt = (PROMPTS / "medical_extraction_prompt_opt_v1.txt").read_text(encoding="utf-8")
+    opt_prompt = load_prompt(prompt_file)
     fingerprint = {"model": model, "settings": SETTINGS, "fields": FIELDS, "prompt": opt_prompt,
                    "rated_cny_per_million": {k: str(v) for k, v in rates.items()},
                    "gold": sha256(dataset / "gold_standard.csv"),
@@ -323,6 +341,10 @@ def run_live(dataset, output, all_papers, selected, texts, model, rates, budget_
     meter = Budget(state, save, rates, budget_cny, model)
     if meter.spent > budget_cny:
         raise ValueError("The recorded spend already exceeds this budget")
+    if texts is None:
+        texts, report = prepare_run(dataset, output, selected, model, prompt_file)
+        if report["errors"] or report["truncated"]:
+            return report
     try:
         with ExitStack() as stack:
             stack.enter_context(meter.guard())
@@ -365,6 +387,7 @@ def run_live(dataset, output, all_papers, selected, texts, model, rates, budget_
                 selected_ids,
             )
         summary = {"run_id": run_id, "model": model, "settings": SETTINGS, "groups": groups,
+                   "prompt_file": Path(prompt_file).name,
                    "selected_ids": selected_ids, "dataset_size": len(all_papers),
                    "gold_sha256": fingerprint["gold"], "pdf_sha256": fingerprint["pdfs"],
                    "rates_cny_per_million": fingerprint["rated_cny_per_million"],
@@ -384,6 +407,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     paths(parser)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--prompt-file", type=Path, default=DEFAULT_PROMPT_FILE,
+                        help="Prompt file for the optimized group (defaults to v1)")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--model", default=DEFAULT_MODEL, choices=sorted(OFFICIAL_MODELS))
     parser.add_argument("--budget-cny", type=Decimal, default=BUDGET_DEFAULT)
@@ -397,6 +422,7 @@ def main():
         parser.error("Set DEEPSEEK_API_KEY and all four rates before a live run")
     report = run(args.dataset, args.output or args.dataset / "evaluation_v1", model=args.model,
                  limit=args.limit, dry_run=args.dry_run, rates=rates, budget_cny=args.budget_cny,
+                 prompt_file=args.prompt_file,
                  api_key=os.getenv("DEEPSEEK_API_KEY", "") if not args.dry_run else "")
     if "groups" not in report:
         print(f'PDFs converted={report["converted"]}, errors={report["errors"]}, '

@@ -33,6 +33,12 @@ PDF 需要有足够的原生文本，使用 pymupdf4llm 关闭 OCR（图像文�
 
 ### 抽取与预算
 
+`--prompt-file` 只切换优化组提示词，省略时仍默认读取 v1 文件。提示词正文与引擎源码参与 `run_id` 计算。新版运行请使用独立输出目录，以便保留历史结果和续跑状态。例如，离线预检可以使用以下命令。
+
+```powershell
+& 'D:\Anaconda\envs\slr\python.exe' -X utf8 -m evaluation.medical.run_medical_eval --dry-run --prompt-file evaluation/prompts/medical_extraction_prompt_opt_v2.txt --output test_output/medical_eval_v1/evaluation_v2_drycheck
+```
+
 `run_medical_eval.py` 跳过筛选。G1 用默认提示词和普通 JSON 抽取。G2 用医学字段提示词、先引句后作答和现有 instructor 结构化路径。两组模型、全文、思考模式、温度 0.05、最大输出 4,000 token 相同。第四字段 `outcomes_measured` 使用旧金标准 CSV 的 `gold_outcomes_and_main_findings` 列，只评结局指标和时间点。
 
 `deepseek-chat` 已停用，默认请求 `deepseek-flash`。模型文档和价格见 [DeepSeek 官方说明](https://api-docs.deepseek.com/quick_start/pricing/)。在线阶段由环境变量 `DEEPSEEK_API_KEY` 提供密钥。命令行需提供以下四个人民币每百万 token 单价。输入价使用缓存未命中价。
@@ -58,6 +64,6 @@ PDF 需要有足够的原生文本，使用 pymupdf4llm 关闭 OCR（图像文�
 
 - L1 校验生成 `l1_quotes.csv` 和 `l1_summary.json`。分别报告严格匹配 `strict_pass`、分段匹配 `fragmented_pass` 和两者合计 `verbatim_match`。冻结门槛使用合计值，两类匹配有物理页码时均计入定位率。物理页码从 1 开始，分母为实质引句。引句与明确的 `Not reported` 事实值另计一致性。
 - `blind_review_sheet.xlsx` 的 `1_Accuracy_Blind` 在全量 20 篇时有 160 行，仅提供准确度评分所需列。完成后按「评分说明」取消隐藏 `2_Evidence_Support`，为有实质引句的字段评分。解盲时自动将其余字段计为 `No_Quote`。映射表 `blind_key.csv` 单独保管。证据页的默认隐藏用于分阶段评分，工作簿可自行取消隐藏。生成器会保护已有工作簿或密钥。
-- 解盲输出 `medical_eval_report.md`，按第 2 版通过门槛和止损红线判断。小于 20 篇的双组样本只给出预评估。字段准确度排除 `not_in_pdf`，引句逻辑支撑度排除 `No_Quote`。95% Wilson 区间按字段观测计算，同篇试验字段间的相关性未纳入区间。
+- 解盲输出 `medical_eval_report.md`，按通过门槛和止损红线判断。严重错误率通过要求优化组不高于基线组，并且至少下降 5 个百分点或优化组自身不超过 3%。小于 20 篇的双组样本只给出预评估。字段准确度排除 `not_in_pdf`，引句逻辑支撑度排除 `No_Quote`。95% Wilson 区间按字段观测计算，同篇试验字段间的相关性未纳入区间。
 
 离线自动化用合成两页 PDF 与模拟 HTTP 返回验证这条流程，真实试验的抽取质量和线上账单需要另行实测。
