@@ -569,7 +569,7 @@ class SystematicReviewAutomation:
     def _extraction_prompt_fingerprint_source(self) -> Dict[str, Any]:
         return {
             'prompt': self.extraction_prompt,
-            'quote_then_answer': self.extraction_mode == 'optimized',
+            'quote_then_answer': 'v2' if self.extraction_mode == 'optimized' else False,
             'fields': self.extraction_fields,
         }
 
@@ -1199,7 +1199,7 @@ class SystematicReviewAutomation:
 
         For each user-defined extraction field (e.g. 'sample_size'), two model
         fields are created:
-          • sample_size_quote — verbatim sentence copied from the paper text
+          • sample_size_quote — verbatim evidence fragments copied from the paper text
           • sample_size       — final extracted value derived ONLY from that quote
 
         Returns the model class, or None if pydantic is not installed.
@@ -1215,10 +1215,14 @@ class SystematicReviewAutomation:
             fields_def[f"{safe}_quote"] = (
                 str,
                 PField(
-                    default="Not found",
+                    default="Not reported",
                     description=(
-                        f"Exact verbatim sentence(s) from the paper text that contain "
-                        f"information about '{field_name}'. Copy word-for-word."
+                        f"For each reported element of '{field_name}', copy the shortest "
+                        "continuous passage verbatim. Join nonadjacent fragments with ' ... '. "
+                        "Preserve punctuation and inline citations. Split at headers or layout "
+                        "interruptions instead of rewriting. For table-only evidence, copy "
+                        "the header and data rows verbatim, separated by ' ... '. "
+                        "Use 'Not reported' if the source contains no relevant evidence."
                     ),
                 ),
             )
@@ -1228,8 +1232,9 @@ class SystematicReviewAutomation:
                     default="Not reported",
                     description=(
                         f"Extracted value for '{field_name}'. "
-                        f"Derive this ONLY from the quote above. "
-                        f"Use 'Not reported' if no relevant quote was found."
+                        "Use the evidence fragments to report all supported elements accurately. "
+                        "Do not invent unreported facts. Use 'Not reported' if the source "
+                        "contains no relevant evidence."
                     ),
                 ),
             )
@@ -1548,9 +1553,13 @@ class SystematicReviewAutomation:
                     ])
                 extraction_prompt += (
                     "\n\nApply the Quote-Then-Answer method for every field:\n"
-                    "  1. Copy a verbatim sentence from the paper as the field_quote.\n"
-                    "  2. Write the extracted value based ONLY on that quote.\n"
-                    "  3. If no relevant text exists, set both field_quote and field to 'Not reported'.\n\n"
+                    "  1. Find all relevant elements for the field in the paper.\n"
+                    "  2. For each element, copy the shortest continuous verbatim passage into field_quote; "
+                    "join nonadjacent fragments with ' ... '. Preserve punctuation and inline citations. "
+                    "Split at headers or layout interruptions instead of rewriting. For table-only evidence, "
+                    "copy the header and data rows verbatim, separated by ' ... '.\n"
+                    "  3. Use the evidence fragments to write a complete answer without inventing unreported facts. "
+                    "If no relevant text exists, set both field_quote and field to 'Not reported'.\n\n"
                     "Return ONLY valid JSON (no prose, no markdown fences):\n"
                     "{\n" + "\n".join(qa_lines).rstrip(',') + "\n}"
                 )

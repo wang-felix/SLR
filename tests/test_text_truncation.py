@@ -369,9 +369,13 @@ def test_unaffected_requests_keep_prompt_bytes_and_cache_context(make_batch, mon
     expected_extraction = (
         f"Extract {prepared}\n\n"
         "Apply the Quote-Then-Answer method for every field:\n"
-        "  1. Copy a verbatim sentence from the paper as the field_quote.\n"
-        "  2. Write the extracted value based ONLY on that quote.\n"
-        "  3. If no relevant text exists, set both field_quote and field to 'Not reported'.\n\n"
+        "  1. Find all relevant elements for the field in the paper.\n"
+        "  2. For each element, copy the shortest continuous verbatim passage into field_quote; "
+        "join nonadjacent fragments with ' ... '. Preserve punctuation and inline citations. "
+        "Split at headers or layout interruptions instead of rewriting. For table-only evidence, "
+        "copy the header and data rows verbatim, separated by ' ... '.\n"
+        "  3. Use the evidence fragments to write a complete answer without inventing unreported facts. "
+        "If no relevant text exists, set both field_quote and field to 'Not reported'.\n\n"
         "Return ONLY valid JSON (no prose, no markdown fences):\n"
         '{\n    "material_quote": "verbatim sentence(s) from the text",\n'
         '    "material": "extracted value, or Not reported"\n}'

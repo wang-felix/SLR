@@ -209,7 +209,7 @@ def test_fixed_cache_keys(make_automation):
         kind="extraction", text=text, prompt=auto._extraction_prompt_fingerprint_source(),
     )
     assert screening["cache_key"] == "788354ed11512f6d510a339aff4494bcdfbc3a797fa3c79739192a2c360711ed"
-    assert extraction["cache_key"] == "73cde48999a4d73506cc3d769423f67e5f6879a08887c10c528db3096a2744e8"
+    assert extraction["cache_key"] == "f4b94f1e238298ba749c20bdc0a4b81c89f1e67d7490198a2a85d201bd9fc517"
 
 
 @pytest.mark.parametrize(

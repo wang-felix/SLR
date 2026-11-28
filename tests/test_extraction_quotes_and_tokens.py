@@ -144,6 +144,19 @@ def audit(auto):
 def test_raw_and_optimized_use_disjoint_caches_and_export_quotes(build):
     opt, manager = build()
     raw, _ = build(extraction_mode="raw")
+    optimized_prompt = opt._extraction_prompt_fingerprint_source()
+    raw_prompt = raw._extraction_prompt_fingerprint_source()
+    assert optimized_prompt["quote_then_answer"] == "v2"
+    assert raw_prompt["quote_then_answer"] is False
+    legacy_prompt = {**optimized_prompt, "quote_then_answer": True}
+    current_key = opt._cache_key_context(kind="extraction", text="paper text", prompt=optimized_prompt)
+    legacy_key = opt._cache_key_context(kind="extraction", text="paper text", prompt=legacy_prompt)
+    assert current_key["cache_key"] != legacy_key["cache_key"]
+
+    schema = opt._generate_dynamic_schema()
+    quote_field = schema.model_fields["study_design_quote"]
+    assert quote_field.default == "Not reported"
+    assert "' ... '" in quote_field.description and "Not reported" in quote_field.description
     emitted_quote = "Participants were randomly allocated."
     manager.chat_completion_structured.return_value = (
         SimpleNamespace(model_dump=lambda: {"study_design": "randomized", "study_design_quote": emitted_quote}), 15,
